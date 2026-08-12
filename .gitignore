@@ -1,0 +1,16 @@
+# Secrets — never commit these
+.env
+
+# Virtual environments
+.venv/
+.venv-1/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Pytest
+.pytest_cache/
+
+# macOS
+.DS_Store
