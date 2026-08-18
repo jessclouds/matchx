@@ -7,31 +7,36 @@ from dotenv import load_dotenv
 
 load_dotenv()   # reads .env and loads it into the environment
 
+from db import get_event
+
 TOKEN: Final = os.getenv("BOT_TOKEN")
 BOT_USERNAME: Final = "@HackathonMatchBot"
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN missing — did you create .env?")
 
-EVENTS = {
-    "ideate2026": "IDEATE 2026",
-    "healthhack2026": "HealthHack 2026"
-}
-
-
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if context.args: # Check if there are any arguments passed with the /start command
-        user_event_code = context.args[0]
-        if user_event_code in EVENTS:
-            event_name = EVENTS[user_event_code]
-            await update.message.reply_text(f'Welcome to {event_name}! How can I assist you today?')
-        else:
-            await update.message.reply_text('Sorry, I do not recognize that event code. Please use a valid event code to start the bot.')
-    else:
-        await update.message.reply_text('Hello! I am your Hackathon Match Bot. How can I assist you today?')
+    if not context.args:
+        await update.message.reply_text(
+            "Hi! Join through your hackathon's link to get started."
+        )
+        return
 
-    
+    event_code = context.args[0]
+    event_name = get_event(event_code)
+
+    if event_name is None:
+        # ← your code: tell them the code isn't recognised, then return
+        await update.message.reply_text("Sorry, I don't recognise that event code.")
+        return
+        
+
+    context.user_data["event_code"] = event_code
+
+    await update.message.reply_text(f"Welcome to {event_name}!")
+    await ask_school(update, context)
+
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text('You can use the following commands:\n'
@@ -67,7 +72,7 @@ SCHOOLS = [
 ]
 
 
-async def school_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def ask_school(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ask the user to select their school from a list of options."""
     keyboard = build_keyboard("school", SCHOOLS, per_row=3)
     await update.message.reply_text("Please select your school:", reply_markup=keyboard
@@ -145,7 +150,7 @@ async def handle_discipline_choice(update: Update, context: ContextTypes.DEFAULT
 # TEAM STATUS
 
 STATUSES = [
-    ("looking", "Looking for a team"),
+    ("looking", "Individual looking for a team"),
     ("has_team", "Have a team, need more teammates"),
 ]
 
@@ -166,7 +171,120 @@ async def handle_team_status_choice(update: Update, context: ContextTypes.DEFAUL
 
     await query.edit_message_text(f"Team status: {team_status}")
     # You can chain to the next question or action here, if needed.
-    await update.effective_chat.send_message("Next, skills. (coming soon!)")  # Placeholder for the next step
+    await ask_skills_offered(update, context)
+
+
+# Skills 
+
+SKILLS = [
+    ("software", "Software / App Development"),
+    ("ai_data", "AI / Data"),
+    ("healthcare", "Healthcare / Clinical Knowledge"),
+    ("user_research", "User Research"),
+    ("uiux", "UI / UX Design"),
+    ("hardware", "Hardware / Engineering"),
+    ("business", "Business / Pitching"),
+    ("marketing", "Marketing / Operations"),
+    ("legal", "Legal / Regulatory"),
+]
+
+OFFER_QUESTION = {
+    "looking":  "What can you bring to a team? (pick up to 3)",
+    "has_team": "What does your team already have? (pick up to 3)",
+}
+
+NEED_QUESTION = {
+    "looking":  "What would you like teammates to bring? (pick up to 3)",
+    "has_team": "What skills does your team need? (pick up to 3)",
+}
+
+
+MAX_SKILLS = 3
+
+def build_skill_keyboard(prefix: str, selected: set[str], show_wildcard:bool = False) -> InlineKeyboardMarkup:
+    """Skill keyboard with ✅ on chosen skills, plus a Done button."""
+    keyboard = []
+    row = []
+
+    for value, label in SKILLS:
+        text = f"✅ {label}" if value in selected else label  # ← blank 1
+        row.append(InlineKeyboardButton(text, callback_data=f"{prefix}_{value}")) # create button with the skill name and callback data 
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+
+    if row:
+        keyboard.append(row)
+
+    if show_wildcard:
+        keyboard.append([InlineKeyboardButton(
+            "✨ No preference — open to anyone",
+            callback_data=f"{prefix}_any",
+        )])
+
+    keyboard.append([InlineKeyboardButton("Done", callback_data=f"{prefix}_done")])   # ← blank 2
+
+    return InlineKeyboardMarkup(keyboard)
+
+# runs when the user selects a skill from the inline keyboard
+async def handle_skill_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query # gets information about the callback query that was sent when the user clicked a button
+
+    prefix, value = query.data.split("_", 1)      # "offer_ai_data" -> "offer", "ai_data"
+    key = f"{prefix}_skills"                      # ← blank 1
+    selected = context.user_data.setdefault(key, set()) # context.user_data is a dict
+
+    if value == "any": # user selected the wildcard option
+        selected.clear() # clear any previously selected skills
+        context.user_data["open_to_any"] = True # set a flag to indicate that the user is open to any skill
+        await query.answer() # acknowledge the callback query
+        await query.edit_message_text(f"Selected: No preference — open to anyone")
+        await show_profile_summary(update, context) # show the final selection
+        return
+        
+    if value == "done": # done selecting skills, so show the final selection
+        await query.answer() # meaning telegram has acknowledged the callback query
+        await query.edit_message_text(f"Selected: {', '.join(selected) or 'nothing'}")
+        if prefix == "offer":
+            await ask_skills_needed(update, context) # chain to the next question
+        else:
+            await show_profile_summary(update, context) # show the final selection
+        return                                     # we'll chain from here next
+
+    if value in selected: # already selected, so deselect it
+        selected.discard(value)
+    elif len(selected) >= MAX_SKILLS:
+        await query.answer(f"You can pick at most {MAX_SKILLS} skills.", show_alert=True) # await for
+        return
+    else:
+        selected.add(value)
+
+
+    await query.answer() 
+    await query.edit_message_reply_markup( 
+        reply_markup=build_skill_keyboard(prefix, selected, show_wildcard=(prefix == "need"))   # replace the keyboard with the updated one showing the new selection
+        
+    )
+
+
+# ask skills offered question
+
+async def ask_skills_offered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status = context.user_data["team_status"] # return the team status e.g. has_team or looking
+    await update.effective_chat.send_message(
+        OFFER_QUESTION[status],
+        reply_markup=build_skill_keyboard("offer", set(), show_wildcard=False),
+    )
+
+async def ask_skills_needed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status = context.user_data["team_status"]
+    await update.effective_chat.send_message(
+        NEED_QUESTION[status],
+        reply_markup=build_skill_keyboard("need", set(), show_wildcard=True),
+    )
+
+async def show_profile_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_chat.send_message(f"(summary placeholder)\n{context.user_data}")
 
 
 # Responses
@@ -189,14 +307,15 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler('start', start_command))
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('match', match_command))
-    application.add_handler(CommandHandler('school', school_command))
+    application.add_handler(CommandHandler('school', ask_school))
     application.add_handler(CallbackQueryHandler(handle_school_choice, pattern='^school_'))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_preference_choice, pattern='^pref_'))
     application.add_handler(CallbackQueryHandler(handle_discipline_choice, pattern='^discipline_'))
     application.add_handler(CallbackQueryHandler(handle_team_status_choice, pattern='^status_'))
+    application.add_handler(CallbackQueryHandler(handle_skill_choice, pattern='^offer_|^need_'))  # handles both skills offered and skills needed
     application.add_error_handler(handle_error)
 
     print("Bot is running...")
-    application.run_polling(poll_interval=3)
+    application.run_polling()
 

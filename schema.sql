@@ -21,10 +21,13 @@ CREATE TABLE profiles (
     skills_offered     TEXT[] NOT NULL,
     skills_needed      TEXT[] NOT NULL,
 
+    open_to_any        BOOLEAN NOT NULL DEFAULT false,   -- ← add this
+
     is_active          BOOLEAN NOT NULL DEFAULT true,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     -- A person may join many hackathons, so identity is the PAIR,
     -- not the telegram_user_id alone.
     PRIMARY KEY (telegram_user_id, event_code)
+    
 );

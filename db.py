@@ -1,6 +1,6 @@
 import os
-import psycopg
-from dotenv import load_dotenv
+import psycopg # Imports the PostgreSQL library that lets Python connect to Postgres and run SQL.  
+from dotenv import load_dotenv # Imports a helper that reads variables from your .env file.
 
 load_dotenv()  # Load environment variables from .env file
 
