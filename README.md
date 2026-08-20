@@ -26,7 +26,17 @@ cp .env.example .env      # then fill in BOT_TOKEN, BOT_USERNAME, DATABASE_URL
 
 The bot logs `Connected as @YourBot` when it's live. Stop it with Ctrl-C.
 
-## Tests
+## Check it works
+
+One command walks two simulated users through the entire journey — onboarding,
+browsing, a match request, an accept — prints every message they'd see in Telegram,
+verifies the rules, and deletes its own test data:
+
+```bash
+.venv/bin/python selfcheck.py
+```
+
+The full suite:
 
 ```bash
 .venv/bin/python -m pytest tests/ -q

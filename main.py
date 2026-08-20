@@ -539,6 +539,10 @@ async def find_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             text = ("🎯 That's everyone new for now.\n\n"
                     "You can take another look at the people you skipped, or widen what you're "
                     "looking for in your profile.")
+        elif seen:
+            text = ("🎯 You've been through everyone here for now.\n\n"
+                    "I'll message you the moment someone answers your request or a new "
+                    "teammate joins.")
         elif others:
             text = ("🤔 Nobody here matches what you're looking for <i>yet</i>.\n\n"
                     "Try adding more skills to “what I need”, or check back as more people join.")

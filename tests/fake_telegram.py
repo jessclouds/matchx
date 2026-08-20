@@ -197,7 +197,8 @@ class Session:
         return self.tap_data(button.callback_data, msg)
 
     def tap_data(self, data: str, msg: Msg | None = None):
-        target = msg or self.last
+        # Falls back to a synthetic message so a "stale button" can always be pressed.
+        target = msg or (self.inbox[-1] if self.inbox else Msg(self.user.id, "(old message)"))
         handler = self.world.callback_handler(data)
         query = FakeQuery(self.world, target, data, self.user)
         update = FakeUpdate(self.user, self.chat, callback_query=query)
