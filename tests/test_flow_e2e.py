@@ -135,7 +135,7 @@ def test_skill_cap_is_enforced(world, event):
     query = alice.tap("User Research")
     assert query.answers and "at most 3" in query.answers[-1][0]
     msg, button = alice.find_button("Software")
-    assert button.text.startswith("✅")
+    assert button.text.startswith("✓"), "selected skills must stay marked"
 
 
 def test_done_with_no_offered_skills_is_refused(world, event):

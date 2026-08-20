@@ -47,7 +47,7 @@ logger = logging.getLogger("hackathon_match")
 
 TOKEN = require_bot_token()
 
-DB_ERROR_TEXT = "😵 I couldn't reach the database just now. Please try that again in a moment."
+DB_ERROR_TEXT = "I couldn't reach the database just now. Please try again in a moment."
 
 # Onboarding order. Each answer either chains to the next step or, when the user is
 # editing a single field, saves and returns to the profile screen.
@@ -143,7 +143,7 @@ async def no_profile_prompt(update: Update) -> None:
     await send(
         update,
         "You're not signed up for a hackathon yet.\n\n"
-        "Open your hackathon's <b>Find Teammates</b> link to join — organisers can create one with /newevent.",
+        "Open your hackathon's Find Teammates link to join. Organisers can create one with /newevent.",
     )
 
 
@@ -185,9 +185,9 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, intro: s
     pending = await run_db(db.get_incoming_requests, profile.telegram_user_id, profile.event_code)
 
     lines = [intro] if intro else []
-    lines.append(f"🏁 <b>{kb.esc(event_name)}</b>")
+    lines.append(f"<b>{kb.esc(event_name)}</b>")
     if pending:
-        lines.append(f"🤝 {len(pending)} request{'s' if len(pending) > 1 else ''} waiting for your answer.")
+        lines.append(f"{len(pending)} request{'s' if len(pending) > 1 else ''} waiting for your answer.")
     lines.append("What would you like to do?")
 
     await send(update, "\n\n".join(lines), reply_markup=kb.main_menu_keyboard(len(matches), len(pending)))
@@ -201,21 +201,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     event_code = db.normalise_event_code(raw_code)
 
     if raw_code and not event_code:
-        await send(update, "That link looks malformed. Ask the organiser for the Find Teammates link again.")
+        await send(update, "That link looks malformed. Ask your organiser for the Find Teammates link again.")
         return
 
     if not event_code:
         # No deep link: existing users go straight to their menu.
         profile = await current_profile(update, context)
         if profile:
-            await show_menu(update, context, intro="👋 Welcome back!")
+            await show_menu(update, context, intro="Welcome back.")
         else:
             await no_profile_prompt(update)
         return
 
     event_name = await run_db(db.get_event, event_code)
     if event_name is None:
-        await send(update, "🤔 I don't recognise that event code. Double-check the link with your organiser.")
+        await send(update, "I don't recognise that event code. Check the link with your organiser.")
         profile = await current_profile(update, context)
         if profile:
             await show_menu(update, context)
@@ -228,16 +228,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     existing = await run_db(db.get_profile, update.effective_user.id, event_code)
 
     if existing:
-        await show_menu(update, context, intro=f"👋 Welcome back to <b>{kb.esc(event_name)}</b>!")
+        await show_menu(update, context, intro=f"Welcome back to <b>{kb.esc(event_name)}</b>.")
         return
 
     context.user_data["draft"] = {"event_code": event_code}
     context.user_data.pop("edit_field", None)
     await send(
         update,
-        f"🎉 You're joining the teammate-matching pool for <b>{kb.esc(event_name)}</b>.\n\n"
-        "<i>Not the right hackathon? Close this and open the link your organiser shared.</i>\n\n"
-        "Six quick taps and I'll start finding you teammates.",
+        f"You're joining the teammate-matching pool for <b>{kb.esc(event_name)}</b>.\n\n"
+        "Not the right hackathon? Close this and open the link your organiser shared.\n\n"
+        "Six quick questions and I'll start finding you teammates.",
     )
     await ask_school(update, context)
 
@@ -286,7 +286,7 @@ async def advance(update: Update, context: ContextTypes.DEFAULT_TYPE, step: str)
 
 
 async def ask_school(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send(update, "🏫 <b>Which school are you from?</b>", reply_markup=kb.build_keyboard("school", SCHOOLS, 3))
+    await send(update, "Which school are you from?", reply_markup=kb.build_keyboard("school", SCHOOLS, 3))
 
 
 async def handle_school_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -294,14 +294,14 @@ async def handle_school_choice(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     school = query.data.split("_", 1)[1]
     draft(context)["school"] = school
-    await safe_edit(query, f"🏫 School: <b>{kb.esc(school)}</b>")
+    await safe_edit(query, f"School: {kb.esc(school)}")
     await advance(update, context, "school")
 
 
 async def ask_school_preference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send(
         update,
-        "🎯 <b>Would you prefer teammates from your own school?</b>",
+        "Would you prefer teammates from your own school?",
         reply_markup=kb.build_keyboard("pref", SCHOOL_PREFERENCES, 1),
     )
 
@@ -312,14 +312,14 @@ async def handle_preference_choice(update: Update, context: ContextTypes.DEFAULT
     preference = query.data.split("_", 1)[1]
     draft(context)["school_preference"] = preference
     label = dict(SCHOOL_PREFERENCES).get(preference, preference)
-    await safe_edit(query, f"🎯 School preference: <b>{kb.esc(label)}</b>")
+    await safe_edit(query, f"School preference: {kb.esc(label)}")
     await advance(update, context, "pref")
 
 
 async def ask_discipline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send(
         update,
-        "📚 <b>What's your main field of study?</b>\n<i>Shown on your card — it doesn't affect matching.</i>",
+        "What's your main field of study?\n<i>Shown on your card — it doesn't affect matching.</i>",
         reply_markup=kb.build_keyboard("discipline", DISCIPLINES, 2),
     )
 
@@ -330,12 +330,12 @@ async def handle_discipline_choice(update: Update, context: ContextTypes.DEFAULT
     discipline = query.data.split("_", 1)[1]
     draft(context)["discipline"] = discipline
     label = dict(DISCIPLINES).get(discipline, discipline)
-    await safe_edit(query, f"📚 Discipline: <b>{kb.esc(label)}</b>")
+    await safe_edit(query, f"Discipline: {kb.esc(label)}")
     await advance(update, context, "discipline")
 
 
 async def ask_team_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send(update, "👥 <b>Where are you at right now?</b>", reply_markup=kb.build_keyboard("status", STATUSES, 1))
+    await send(update, "Where are you at right now?", reply_markup=kb.build_keyboard("status", STATUSES, 1))
 
 
 async def handle_team_status_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -344,7 +344,7 @@ async def handle_team_status_choice(update: Update, context: ContextTypes.DEFAUL
     team_status = query.data.split("_", 1)[1]
     draft(context)["team_status"] = team_status
     label = dict(STATUSES).get(team_status, team_status)
-    await safe_edit(query, f"👥 Status: <b>{kb.esc(label)}</b>")
+    await safe_edit(query, f"Status: {kb.esc(label)}")
     await advance(update, context, "status")
 
 
@@ -356,7 +356,7 @@ async def ask_skills_offered(update: Update, context: ContextTypes.DEFAULT_TYPE)
     selected = set(draft(context).get("offer_skills", set()))
     await send(
         update,
-        f"💪 <b>{OFFER_QUESTION[_team_status(context)]}</b>",
+        OFFER_QUESTION[_team_status(context)],
         reply_markup=kb.build_skill_keyboard("offer", selected, show_wildcard=False),
     )
 
@@ -365,7 +365,7 @@ async def ask_skills_needed(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     selected = set(draft(context).get("need_skills", set()))
     await send(
         update,
-        f"🔎 <b>{NEED_QUESTION[_team_status(context)]}</b>",
+        NEED_QUESTION[_team_status(context)],
         reply_markup=kb.build_skill_keyboard("need", selected, show_wildcard=True),
     )
 
@@ -383,8 +383,8 @@ async def handle_skill_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         data[key] = set()
         data["open_to_any"] = True
-        await query.answer("Open to anyone ✨")
-        await safe_edit(query, "🔎 Looking for: <b>Anyone — no preference</b>")
+        await query.answer("Open to anyone")
+        await safe_edit(query, "Looking for: anyone — no preference")
         await advance(update, context, "need")
         return
 
@@ -396,9 +396,9 @@ async def handle_skill_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
             data["open_to_any"] = not selected
         data[key] = selected
         await query.answer()
-        emoji, label = ("💪", "I offer") if prefix == "offer" else ("🔎", "Looking for")
-        empty = "Anyone — no preference"
-        await safe_edit(query, f"{emoji} {label}: <b>{kb.esc(format_skills(selected, empty))}</b>")
+        label = "You offer" if prefix == "offer" else "Looking for"
+        empty = "anyone — no preference"
+        await safe_edit(query, f"{label}: {kb.esc(format_skills(selected, empty))}")
         await advance(update, context, "offer" if prefix == "offer" else "need")
         return
 
@@ -465,7 +465,7 @@ async def save_and_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     profile = await run_db(db.get_profile, user.id, event_code)
     event_name = await event_name_for(context, event_code)
-    await send(update, "✅ <b>Profile saved!</b>\n\n" + kb.render_profile(profile, event_name))
+    await send(update, "Profile saved.\n\n" + kb.render_profile(profile, event_name))
     await find_matches(update, context)
 
 
@@ -495,7 +495,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     context.user_data["draft"] = {"event_code": event_code}
     context.user_data.pop("edit_field", None)
-    await send(update, "🔁 Starting your profile over. Your matches and requests are kept.")
+    await send(update, "Starting your profile over. Your matches and requests are kept.")
     await ask_school(update, context)
 
 
@@ -503,7 +503,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     context.user_data.pop("mode", None)
     context.user_data.pop("pending_event_name", None)
     context.user_data.pop("edit_field", None)
-    await send(update, "Okay, cancelled.", reply_markup=kb.home_keyboard())
+    await send(update, "Cancelled.", reply_markup=kb.home_keyboard())
 
 
 # ------------------------------------------------------------------- browsing
@@ -524,7 +524,8 @@ async def find_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not profile.is_active:
         await send(
             update,
-            "⏸ Your matchmaking is paused, so you're hidden from others.\nResume it to start browsing again.",
+            "Your matchmaking is paused, so you're hidden from others. "
+            "Resume it to start browsing again.",
             reply_markup=kb.profile_keyboard(False),
         )
         return
@@ -538,18 +539,18 @@ async def find_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         skipped = await run_db(db.get_skipped_user_ids, user_id, profile.event_code)
         others = [p for p in pool if p.telegram_user_id != user_id]
         if skipped:
-            text = ("🎯 That's everyone new for now.\n\n"
-                    "You can take another look at the people you skipped, or widen what you're "
+            text = ("That's everyone new for now.\n\n"
+                    "You can look again at the people you skipped, or widen what you're "
                     "looking for in your profile.")
         elif seen:
-            text = ("🎯 You've been through everyone here for now.\n\n"
-                    "I'll message you the moment someone answers your request or a new "
+            text = ("You've been through everyone here for now.\n\n"
+                    "I'll message you when someone answers your request, or when a new "
                     "teammate joins.")
         elif others:
-            text = ("🤔 Nobody here matches what you're looking for <i>yet</i>.\n\n"
-                    "Try adding more skills to “what I need”, or check back as more people join.")
+            text = ("Nobody here matches what you're looking for yet.\n\n"
+                    "Try adding more skills to what you need, or check back as more people join.")
         else:
-            text = ("🌱 You're one of the first here!\n\n"
+            text = ("You're one of the first here.\n\n"
                     "I'll have candidates as soon as more teammates sign up — check back soon.")
         await send(update, text, reply_markup=kb.no_candidates_keyboard(bool(skipped)))
         return
@@ -577,7 +578,7 @@ async def handle_browse_action(update: Update, context: ContextTypes.DEFAULT_TYP
     if action == "reset":
         await query.answer()
         cleared = await run_db(db.clear_skips, profile.telegram_user_id, profile.event_code)
-        await safe_edit(query, f"🔄 Brought back {cleared} skipped teammate{'s' if cleared != 1 else ''}.")
+        await safe_edit(query, f"Brought back {cleared} skipped teammate{'s' if cleared != 1 else ''}.")
         await find_matches(update, context)
         return
 
@@ -601,7 +602,7 @@ async def handle_browse_action(update: Update, context: ContextTypes.DEFAULT_TYP
     if action == "skip":
         await query.answer("Skipped")
         await run_db(db.record_skip, profile.telegram_user_id, profile.event_code, candidate_id)
-        await safe_edit(query, "⏭ <i>Skipped.</i>")
+        await safe_edit(query, "Skipped.")
         await find_matches(update, context)
         return
 
@@ -627,7 +628,7 @@ async def handle_request(
     event_name = await event_name_for(context, me.event_code)
 
     if result == "matched":
-        await query.answer("It's a match! 🎉")
+        await query.answer("It's a match")
         await safe_edit(query, kb.render_match(other), reply_markup=kb.home_keyboard())
         fresh_me = await run_db(db.get_profile, me.telegram_user_id, me.event_code) or me
         await notify(context, candidate_id, kb.render_match(fresh_me), reply_markup=kb.home_keyboard())
@@ -641,7 +642,7 @@ async def handle_request(
 
     if result == "already_pending":
         await query.answer("Already sent — waiting on their answer.", show_alert=True)
-        await safe_edit(query, "⏳ <i>Request already sent — waiting for their answer.</i>")
+        await safe_edit(query, "Request already sent — waiting for their answer.")
         await find_matches(update, context)
         return
 
@@ -651,8 +652,8 @@ async def handle_request(
         return
 
     # 'requested' — deliver my card to them so they never have to find me by chance.
-    await query.answer("Request sent 🤝")
-    await safe_edit(query, "🤝 <i>Request sent! I'll tell you the moment they answer.</i>")
+    await query.answer("Request sent")
+    await safe_edit(query, "Request sent. I'll tell you when they answer.")
 
     my_card = score(other, me)   # scored from the recipient's point of view
     delivered = await notify(
@@ -696,13 +697,13 @@ async def handle_response(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if result in ("not_found", "already_declined"):
         await query.answer("That request is no longer open.", show_alert=True)
-        await safe_edit(query, "🚫 <i>This request is no longer open.</i>", reply_markup=kb.home_keyboard())
+        await safe_edit(query, "This request is no longer open.", reply_markup=kb.home_keyboard())
         return
 
     requester = await run_db(db.get_profile, requester_id, event_code)
 
     if result == "already_matched":
-        await query.answer("You're already matched 🎉")
+        await query.answer("You're already matched")
         if requester:
             await safe_edit(query, kb.render_match(requester), reply_markup=kb.home_keyboard())
         return
@@ -711,14 +712,14 @@ async def handle_response(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("Declined")
         await safe_edit(
             query,
-            "🚫 <i>Declined. They won't be told who said no.</i>",
+            "Declined. They won't be told who said no.",
             reply_markup=kb.home_keyboard(),
         )
         return
 
     # result == 'matched' — notify exactly once, on this transition only.
     me = await run_db(db.get_profile, me_id, event_code)
-    await query.answer("It's a match! 🎉")
+    await query.answer("It's a match")
     if requester:
         await safe_edit(query, kb.render_match(requester), reply_markup=kb.home_keyboard())
     if me:
@@ -743,17 +744,18 @@ async def matches_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not matches and not incoming and not outgoing:
         await send(
             update,
-            "You have no matches yet.\n\nBrowse teammates and send a request — I'll let you know the second someone says yes.",
+            "You have no matches yet.\n\n"
+            "Browse teammates and send a request — I'll let you know when someone says yes.",
             reply_markup=kb.main_menu_keyboard(),
         )
         return
 
     if matches:
-        header = f"🎉 <b>Your matches ({len(matches)})</b>"
+        header = f"<b>Your matches ({len(matches)})</b>"
         body = "\n\n".join(
-            f"• 🏫 {kb.esc(p.school)} — 💪 {kb.esc(format_skills(p.skills_offered))}\n"
-            f"  💬 <b>@{kb.esc(p.telegram_username)}</b>" if p.telegram_username else
-            f"• 🏫 {kb.esc(p.school)} — contact unavailable"
+            f"{kb.esc(p.school)} — {kb.esc(format_skills(p.skills_offered))}\n"
+            f"<b>@{kb.esc(p.telegram_username)}</b>" if p.telegram_username else
+            f"{kb.esc(p.school)} — contact unavailable"
             for p in matches
         )
         await send(update, f"{header}\n\n{body}")
@@ -761,13 +763,13 @@ async def matches_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if outgoing:
         await send(
             update,
-            f"⏳ <b>Waiting on {len(outgoing)} person{'s' if len(outgoing) > 1 else ''}</b>\n"
-            "<i>You'll get a message the moment they answer.</i>",
+            f"Waiting on {len(outgoing)} person{'s' if len(outgoing) > 1 else ''}. "
+            "You'll get a message when they answer.",
         )
 
     if incoming:
         event_name = await event_name_for(context, event_code)
-        await send(update, f"🤝 <b>{len(incoming)} request{'s' if len(incoming) > 1 else ''} for you</b>")
+        await send(update, f"<b>{len(incoming)} request{'s' if len(incoming) > 1 else ''} for you</b>")
         for requester in incoming:
             await send(
                 update,
@@ -798,7 +800,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif action == "help":
         await help_command(update, context)
     elif action == "edit":
-        await send(update, "✏️ <b>What would you like to change?</b>", reply_markup=kb.edit_keyboard())
+        await send(update, "What would you like to change?", reply_markup=kb.edit_keyboard())
     elif action == "restart":
         await restart_command(update, context)
     elif action in ("pause", "resume"):
@@ -809,9 +811,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         active = action == "resume"
         await run_db(db.set_active, profile.telegram_user_id, profile.event_code, active)
         text = (
-            "▶️ You're visible again — happy matching!"
+            "You're visible again."
             if active
-            else "⏸ Matchmaking paused. You won't appear to others until you resume."
+            else "Matchmaking paused. You won't appear to others until you resume."
         )
         await send(update, text, reply_markup=kb.home_keyboard())
 
@@ -863,7 +865,7 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["event_code"] = rows[0]["event_code"]
         await show_menu(update, context)
         return
-    await send(update, "🏁 <b>Your hackathons</b>\nPick the one you want to work in:",
+    await send(update, "Your hackathons — pick the one you want to work in:",
                reply_markup=kb.event_picker_keyboard(rows))
 
 
@@ -875,7 +877,7 @@ async def newevent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not may_create_events(user_id):
         await send(
             update,
-            "🔒 Creating hackathons is limited to organisers.\n\n"
+            "Creating hackathons is limited to organisers.\n\n"
             f"Ask whoever runs this bot to add your Telegram ID <code>{user_id}</code> "
             "to <code>ORGANISER_IDS</code>.",
         )
@@ -885,7 +887,7 @@ async def newevent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data.pop("pending_event_name", None)
     await send(
         update,
-        "📣 <b>Create a hackathon</b>\n\n"
+        "Create a hackathon.\n\n"
         "First — what's the hackathon called?\n"
         "<i>Participants see this name when they join, so they can check they're in the "
         "right pool.</i>\n\n"
@@ -904,9 +906,9 @@ async def capture_event_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["mode"] = "await_announcement"
     await send(
         update,
-        f"👍 Got it — <b>{kb.esc(name[:120])}</b>.\n\n"
+        f"Got it — <b>{kb.esc(name[:120])}</b>.\n\n"
         "Now paste or forward the hackathon announcement.\n\n"
-        "I'll send it straight back — unchanged — with a <b>Find Teammates</b> link added, "
+        "I'll send it back unchanged, with a Find Teammates link added, "
         "ready to copy-paste into your channel.\n\n"
         "Send /cancel to stop.",
     )
@@ -946,7 +948,7 @@ async def create_event_from_announcement(update: Update, context: ContextTypes.D
     # 2. Instructions, kept separate so they are not copied along with the post.
     await send(
         update,
-        f"☝️ <b>{kb.esc(event_name)}</b> is live — copy the message above and post it.\n\n"
+        f"<b>{kb.esc(event_name)}</b> is live. Copy the message above and post it.\n\n"
         f"Everyone who joins through that link is matched only with people from this "
         f"hackathon.\n\n"
         f"Event code: <code>{kb.esc(event_code)}</code>  ·  /myevents to see it again.",
@@ -960,8 +962,8 @@ async def myevents_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await send(update, "You haven't created any hackathons yet. Use /newevent to make one.")
         return
     blocks = [
-        f"🏁 <b>{kb.esc(e['name'])}</b>\n"
-        f"👥 {e['participants']} joined\n"
+        f"<b>{kb.esc(e['name'])}</b>\n"
+        f"{e['participants']} joined\n"
         f"<code>{kb.esc(deep_link(e['event_code']))}</code>"
         for e in events
     ]
@@ -987,12 +989,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     if mid_onboarding or context.user_data.get("edit_field"):
-        await send(update, "👆 Tap one of the buttons above to continue — or /restart to begin again.")
+        await send(update, "Tap one of the buttons above to continue, or /restart to begin again.")
         return
 
     profile = await current_profile(update, context)
     if profile:
-        await show_menu(update, context, intro="I work with buttons 🙂")
+        await show_menu(update, context, intro="I work with buttons.")
     else:
         await no_profile_prompt(update)
 
@@ -1008,7 +1010,7 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
         elif update.effective_chat:
             try:
                 await update.effective_chat.send_message(
-                    "😵 Something went wrong on my side. Please try again.",
+                    "Something went wrong on my side. Please try again.",
                     reply_markup=kb.home_keyboard(),
                 )
             except TelegramError:
