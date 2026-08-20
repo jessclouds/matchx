@@ -465,3 +465,60 @@ def test_newevent_can_be_cancelled(world):
     organiser.command("cancel")
     organiser.say("this should not become an event")
     assert "?start=" not in organiser.all_text()
+
+
+# ------------------------------------------------------------ failure modes
+
+def test_blocked_recipient_does_not_break_the_requester(world, event, monkeypatch):
+    """The other user blocked the bot: the request is still recorded, no crash."""
+    from telegram.error import Forbidden
+
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",))
+
+    async def blocked(*args, **kwargs):
+        raise Forbidden("bot was blocked by the user")
+
+    monkeypatch.setattr(world.bot, "send_message", blocked)
+
+    alice.clear()
+    alice.command("find")
+    alice.tap("Request match")
+    assert "Request sent" in alice.all_text()
+    assert [p.telegram_user_id for p in db.get_incoming_requests(BOB, event)] == [ALICE]
+
+
+def test_database_outage_shows_a_friendly_message(world, event, monkeypatch):
+    alice = Session(world, ALICE, "alice")
+    onboard(alice, event)
+
+    def boom(*args, **kwargs):
+        raise db.DatabaseError("connection refused")
+
+    monkeypatch.setattr(db, "get_profile", boom)
+    monkeypatch.setattr(db, "get_latest_profile", boom)
+
+    alice.clear()
+    alice.command("matches")
+    assert "database" in alice.last.text.lower()
+    assert "connection refused" not in alice.all_text(), "internal errors must not leak"
+    assert alice.has_button("Menu")
+
+
+def test_database_outage_during_a_button_tap_only_alerts(world, event, monkeypatch):
+    alice = Session(world, ALICE, "alice")
+    onboard(alice, event)
+    alice.command("profile")
+
+    def boom(*args, **kwargs):
+        raise db.DatabaseError("connection refused")
+
+    monkeypatch.setattr(db, "get_profile", boom)
+    monkeypatch.setattr(db, "get_latest_profile", boom)
+
+    alice.tap("Find teammates")
+    assert "database" in alice.last.text.lower(), alice.debug()
+    assert "connection refused" not in alice.all_text()
+    assert alice.has_button("Menu")

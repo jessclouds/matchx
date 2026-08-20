@@ -156,12 +156,16 @@ def db_guard(handler: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable
         except DatabaseError:
             logger.exception("Database error in %s", handler.__name__)
             if update.callback_query:
+                # The query may already have been answered, so the message is the
+                # reliable channel — the alert is only a nicety on top.
                 try:
                     await update.callback_query.answer(DB_ERROR_TEXT, show_alert=True)
                 except TelegramError:
                     pass
-            else:
+            try:
                 await send(update, DB_ERROR_TEXT, reply_markup=kb.home_keyboard())
+            except TelegramError:
+                pass
 
     wrapper.__name__ = handler.__name__
     return wrapper
