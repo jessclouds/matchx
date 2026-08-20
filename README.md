@@ -83,10 +83,12 @@ them bot access. Set `ORGANISER_IDS=<telegram id>,<telegram id>` to limit who ma
 ## How the product works
 
 ### Organiser
-1. `/newevent` (`/cancel` backs out; the flow is per organiser, so two organisers can
-   run it at the same time without interfering)
-2. Paste or forward the hackathon announcement — the first line becomes the event name
-3. The bot replies with **that same announcement, unchanged**, with this appended:
+1. `/newevent` (`/cancel` backs out at any step; the flow is per organiser, so two
+   organisers can run it at the same time without interfering)
+2. Type the hackathon's **name** — this is authoritative and is what participants see
+   when they join; it is never inferred from the announcement text
+3. Paste or forward the hackathon announcement
+4. The bot replies with **that same announcement, unchanged**, with this appended:
 
    > 🤝 **Looking for teammates?**
    > MatchX helps you find people with complementary skills and connect when both sides are interested.
@@ -94,13 +96,15 @@ them bot access. Set `ORGANISER_IDS=<telegram id>,<telegram id>` to limit who ma
 
    Copy that message and post it as-is. A follow-up message (event code, tips) is sent
    separately so it never ends up in the copy-paste.
-4. `/myevents` lists your events, links and participant counts
+5. `/myevents` lists your events, links and participant counts
 
 Every generated link maps to that hackathon's pool only — participants who join through
 different links never see each other.
 
 ### Participant
-1. Open the organiser's link → `/start <event_code>`
+1. Open the organiser's link — the bot confirms *"You're joining the teammate-matching
+   pool for &lt;hackathon name&gt;"* so they can check they're in the right pool.
+   Participants never type or pick an event code; the link carries it.
 2. Six questions: school → school preference → discipline → team status → skills offered → skills needed
 3. Browse candidates one at a time: **🤝 Request match** or **⏭ Skip**
 4. A request pushes your (anonymous) card straight to that person — they never have to

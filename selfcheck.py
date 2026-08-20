@@ -26,7 +26,7 @@ import db  # noqa: E402
 import main  # noqa: E402
 from fake_telegram import Session, World  # noqa: E402
 
-ADA, BEN = 990_000_101, 990_000_102
+ADA, BEN, ORGANISER = 990_000_101, 990_000_102, 990_000_109
 
 GREEN, RED, DIM, BOLD, RESET = "\033[32m", "\033[31m", "\033[2m", "\033[1m", "\033[0m"
 
@@ -69,20 +69,36 @@ def main_check() -> int:
     check("database reachable", db.ping())
 
     world = World(main.build_application())
-    event_code, event_name = db.create_event(
-        f"Selfcheck Hack {uuid.uuid4().hex[:4]}", "demo announcement", ADA
-    )
+    organiser = Session(world, ORGANISER, "organiser")
+    event_name = f"Selfcheck Hack {uuid.uuid4().hex[:4]}"
+    event_code = ""
 
     try:
-        step("1. Organiser creates an event")
-        print(f"  {DIM}link:{RESET} https://t.me/{__import__('config').BOT_USERNAME}?start={event_code}")
-        check("event is stored and findable by code", db.get_event(event_code) == event_name)
+        step("1. Organiser runs /newevent — name first, then the announcement")
+        organiser.command("newevent")
+        organiser.say(event_name)
+        organiser.clear()
+        organiser.say(
+            f"{event_name} 🚀\n"
+            "12-14 September, NUS Enterprise\n"
+            "Build health-tech in 48 hours. $5k prizes."
+        )
+        post = organiser.inbox[0].text
+        event_code = post.split("?start=")[1].split()[0].strip()
+        show("Organiser", organiser)
+
+        check("the announcement comes back unchanged", "Build health-tech in 48 hours." in post)
+        check("the MatchX call-to-action is appended", "Looking for teammates?" in post)
+        check("the post carries the join link", "?start=" in post)
+        check("the typed name is authoritative", db.get_event(event_code) == event_name)
 
         ada = Session(world, ADA, "ada_dev")
         ben = Session(world, BEN, "ben_design")
 
-        step("2. Ada joins through the link and onboards (developer who needs a designer)")
+        step("2. Ada opens the link and onboards (developer who needs a designer)")
         ada.command("start", event_code)
+        check("Ada is told which pool she's joining",
+              "teammate-matching pool for" in ada.inbox[0].text and event_name in ada.inbox[0].text)
         ada.tap("NUS"); ada.tap("No preference"); ada.tap("Computing"); ada.tap("Solo")
         ada.tap("Software"); ada.tap("Done")
         ada.tap("UI / UX"); ada.tap("Done")
@@ -156,7 +172,8 @@ def main_check() -> int:
         show("Ada", ada)
 
     finally:
-        purge(event_code)
+        if event_code:
+            purge(event_code)
         print(f"\n{DIM}test data deleted{RESET}")
 
     print()

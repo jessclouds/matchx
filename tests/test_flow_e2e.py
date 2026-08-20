@@ -449,10 +449,61 @@ ANNOUNCEMENT = (
 )
 
 
+def test_newevent_asks_for_the_name_first(world):
+    organiser = Session(world, ORGANISER, "organiser")
+    organiser.command("newevent")
+    assert "called" in organiser.last.text.lower()
+    assert "announcement" not in organiser.last.text.lower()
+
+    organiser.say("IDEATE 2026")
+    assert "announcement" in organiser.last.text.lower()
+    assert "IDEATE 2026" in organiser.last.text
+
+    organiser.clear()
+    organiser.say(ANNOUNCEMENT)
+    code = _event_code_from(organiser.inbox[0].text)
+    world._created_events.append(code)
+    assert db.get_event(code) == "IDEATE 2026"
+
+
+def test_entered_name_wins_over_the_announcement_text(world):
+    """The name the organiser typed is authoritative — never inferred from the text."""
+    organiser = Session(world, ORGANISER, "organiser")
+    organiser.command("newevent")
+    organiser.say("HealthHack Singapore 2026")
+    organiser.clear()
+    organiser.say("SOME OTHER TITLE IN THE POSTER\nregister at example.com")
+
+    code = _event_code_from(organiser.inbox[0].text)
+    world._created_events.append(code)
+    assert db.get_event(code) == "HealthHack Singapore 2026"
+
+    # And a participant is told which pool they are joining.
+    alice = Session(world, ALICE, "alice")
+    alice.command("start", code)
+    assert "teammate-matching pool for" in alice.inbox[0].text
+    assert "HealthHack Singapore 2026" in alice.inbox[0].text
+    assert alice.has_button("NUS"), "onboarding still starts right after"
+
+
+def test_participant_never_types_an_event_code(world, event):
+    """Everything comes from the deep link; there is no code to enter or pick."""
+    alice = Session(world, ALICE, "alice")
+    alice.command("start", event)
+    joined = alice.inbox[0].text
+    assert "teammate-matching pool for" in joined
+    assert not any("code" in b.text.lower() for m in alice.inbox for b in m.buttons())
+    onboard_taps = ("NUS", "No preference", "Computing", "Solo")
+    for tap in onboard_taps:
+        alice.tap(tap)
+    alice.tap("Software"); alice.tap("Done"); alice.tap("UI / UX"); alice.tap("Done")
+    assert db.get_profile(ALICE, event).event_code == event
+
+
 def test_newevent_returns_the_announcement_unchanged_with_the_cta(world):
     organiser = Session(world, ORGANISER, "organiser")
     organiser.command("newevent")
-    assert "announcement" in organiser.last.text.lower()
+    organiser.say("IDEATE 2026 🚀")
 
     organiser.clear()
     organiser.say(ANNOUNCEMENT)
@@ -479,19 +530,21 @@ def test_newevent_returns_the_announcement_unchanged_with_the_cta(world):
 
     code = _event_code_from(post)
     world._created_events.append(code)
-    assert db.get_event(code) == "IDEATE 2026 🚀"
+    assert db.get_event(code) == "IDEATE 2026 🚀"      # the name the organiser typed
 
 
 def test_link_from_newevent_leads_into_that_events_pool_only(world):
     organiser = Session(world, ORGANISER, "organiser")
 
     organiser.command("newevent")
+    organiser.say("Alpha Hack")
     organiser.clear()
     organiser.say("Alpha Hack\nFirst event")
     code_a = _event_code_from(organiser.inbox[0].text)
     world._created_events.append(code_a)
 
     organiser.command("newevent")
+    organiser.say("Beta Hack")
     organiser.clear()
     organiser.say("Beta Hack\nSecond event")
     code_b = _event_code_from(organiser.inbox[0].text)
@@ -520,7 +573,9 @@ def test_newevent_state_is_per_organiser(world):
     bystander = Session(world, CAROL, "carol")
 
     organiser.command("newevent")
+    organiser.say("Gamma Hack")
 
+    # The bystander types during both of the organiser's steps.
     bystander.say("just chatting, definitely not an announcement")
     assert "?start=" not in bystander.all_text()
 
@@ -537,6 +592,7 @@ def test_newevent_state_is_per_organiser(world):
 def test_second_message_after_newevent_is_not_another_event(world):
     organiser = Session(world, ORGANISER, "organiser")
     organiser.command("newevent")
+    organiser.say("Delta Hack")
     organiser.clear()
     organiser.say("Delta Hack\nannouncement")
     world._created_events.append(_event_code_from(organiser.inbox[0].text))
@@ -548,6 +604,7 @@ def test_second_message_after_newevent_is_not_another_event(world):
 def test_organiser_flow_end_to_end_with_myevents(world):
     organiser = Session(world, ORGANISER, "organiser")
     organiser.command("newevent")
+    organiser.say("Quantum Hack 2026")
     organiser.clear()
     organiser.say("Quantum Hack 2026\nJoin us this weekend at NUS!")
     code = _event_code_from(organiser.inbox[0].text)
@@ -562,12 +619,24 @@ def test_organiser_flow_end_to_end_with_myevents(world):
     assert "Quantum Hack 2026" in organiser.last.text and "1 joined" in organiser.last.text
 
 
-def test_newevent_can_be_cancelled(world):
+def test_newevent_can_be_cancelled_at_either_step(world):
     organiser = Session(world, ORGANISER, "organiser")
-    organiser.command("newevent")
+
+    organiser.command("newevent")            # cancel before naming it
     organiser.command("cancel")
     organiser.say("this should not become an event")
     assert "?start=" not in organiser.all_text()
+
+    organiser.clear()
+    organiser.command("newevent")            # cancel after naming it
+    organiser.say("Abandoned Hack")
+    organiser.command("cancel")
+    organiser.say("this announcement should go nowhere")
+    assert "?start=" not in organiser.all_text()
+
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM events WHERE name = %s", ("Abandoned Hack",))
+        assert cur.fetchone()["n"] == 0
 
 
 # ------------------------------------------------------------ failure modes

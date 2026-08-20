@@ -235,7 +235,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     context.user_data.pop("edit_field", None)
     await send(
         update,
-        f"🎉 Welcome to <b>{kb.esc(event_name)}</b>!\n\n"
+        f"🎉 You're joining the teammate-matching pool for <b>{kb.esc(event_name)}</b>.\n\n"
+        "<i>Not the right hackathon? Close this and open the link your organiser shared.</i>\n\n"
         "Six quick taps and I'll start finding you teammates.",
     )
     await ask_school(update, context)
@@ -500,6 +501,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("mode", None)
+    context.user_data.pop("pending_event_name", None)
     context.user_data.pop("edit_field", None)
     await send(update, "Okay, cancelled.", reply_markup=kb.home_keyboard())
 
@@ -879,11 +881,31 @@ async def newevent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    context.user_data["mode"] = "await_announcement"
+    context.user_data["mode"] = "await_event_name"
+    context.user_data.pop("pending_event_name", None)
     await send(
         update,
         "📣 <b>Create a hackathon</b>\n\n"
-        "Paste or forward your hackathon announcement (the first line becomes the name).\n\n"
+        "First — what's the hackathon called?\n"
+        "<i>Participants see this name when they join, so they can check they're in the "
+        "right pool.</i>\n\n"
+        "Send /cancel to stop.",
+    )
+
+
+async def capture_event_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Step 1 of /newevent — the organiser types the hackathon's name."""
+    name = (update.message.text or "").strip().splitlines()[0].strip() if update.message.text else ""
+    if not name:
+        await send(update, "I need a name for the hackathon. Send it as a short line of text, or /cancel.")
+        return
+
+    context.user_data["pending_event_name"] = name[:120]
+    context.user_data["mode"] = "await_announcement"
+    await send(
+        update,
+        f"👍 Got it — <b>{kb.esc(name[:120])}</b>.\n\n"
+        "Now paste or forward the hackathon announcement.\n\n"
         "I'll send it straight back — unchanged — with a <b>Find Teammates</b> link added, "
         "ready to copy-paste into your channel.\n\n"
         "Send /cancel to stop.",
@@ -897,14 +919,22 @@ async def create_event_from_announcement(update: Update, context: ContextTypes.D
     The reply is the organiser's announcement, unchanged, with the MatchX call-to-action
     appended — so it can be copy-pasted straight into a hackathon channel.
     """
-    context.user_data.pop("mode", None)          # state is per organiser (user_data)
-    announcement = (update.message.text or update.message.caption or "").strip()
-    if not announcement:
-        await send(update, "I couldn't read any text there. Send /newevent to try again.")
+    name = context.user_data.get("pending_event_name")
+    if not name:
+        # State was lost (restart, or the steps ran out of order) — ask again.
+        context.user_data["mode"] = "await_event_name"
+        await send(update, "Let's start with the name — what's the hackathon called?")
         return
 
+    announcement = (update.message.text or update.message.caption or "").strip()
+    if not announcement:
+        await send(update, "I couldn't read any text there. Paste the announcement, or /cancel.")
+        return
+
+    context.user_data.pop("mode", None)          # state is per organiser (user_data)
+    context.user_data.pop("pending_event_name", None)
+
     organiser_id = update.effective_user.id
-    name = next((line.strip() for line in announcement.splitlines() if line.strip()), "Hackathon")[:120]
     event_code, event_name = await run_db(db.create_event, name, announcement[:4000], organiser_id)
     link = deep_link(event_code)
     logger.info("Organiser %s created event %s", organiser_id, event_code)
@@ -943,7 +973,11 @@ async def myevents_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 @db_guard
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if context.user_data.get("mode") == "await_announcement":
+    mode = context.user_data.get("mode")
+    if mode == "await_event_name":
+        await capture_event_name(update, context)
+        return
+    if mode == "await_announcement":
         await create_event_from_announcement(update, context)
         return
 
