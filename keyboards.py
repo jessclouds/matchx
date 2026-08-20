@@ -211,3 +211,32 @@ def render_match(profile: Profile) -> str:
         f"💬 Message them: <b>{esc(username)}</b>\n"
         "<i>Tip: say hi first — mention the hackathon and what you're building.</i>"
     )
+
+
+# ------------------------------------------------------- organiser event post
+
+TELEGRAM_MAX_CHARS = 4096
+
+CTA_BLOCK = (
+    "🤝 <b>Looking for teammates?</b>\n"
+    "MatchX helps you find people with complementary skills and connect when both "
+    "sides are interested.\n"
+    "<b>Find teammates:</b> {link}"
+)
+
+
+def render_event_post(announcement: str, link: str) -> list[str]:
+    """The organiser's announcement, unchanged, with the MatchX call-to-action appended.
+
+    Returns the message(s) to send. Normally one, ready to copy-paste straight into a
+    hackathon channel; a second is used only when the announcement is so long that
+    both would not fit in one Telegram message.
+    """
+    cta = CTA_BLOCK.format(link=esc(link))
+    body = esc(announcement.strip())
+    combined = f"{body}\n\n{cta}"
+
+    if len(combined) <= TELEGRAM_MAX_CHARS:
+        return [combined]
+    # Never truncate someone's announcement — split instead.
+    return [body[:TELEGRAM_MAX_CHARS], cta]

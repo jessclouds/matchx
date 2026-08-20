@@ -83,10 +83,21 @@ them bot access. Set `ORGANISER_IDS=<telegram id>,<telegram id>` to limit who ma
 ## How the product works
 
 ### Organiser
-1. `/newevent`
-2. Paste or forward the hackathon announcement (first line becomes the event name)
-3. The bot replies with a unique **Find Teammates** link — `https://t.me/<bot>?start=<event_code>`
+1. `/newevent` (`/cancel` backs out; the flow is per organiser, so two organisers can
+   run it at the same time without interfering)
+2. Paste or forward the hackathon announcement — the first line becomes the event name
+3. The bot replies with **that same announcement, unchanged**, with this appended:
+
+   > 🤝 **Looking for teammates?**
+   > MatchX helps you find people with complementary skills and connect when both sides are interested.
+   > **Find teammates:** `https://t.me/<bot>?start=<event_code>`
+
+   Copy that message and post it as-is. A follow-up message (event code, tips) is sent
+   separately so it never ends up in the copy-paste.
 4. `/myevents` lists your events, links and participant counts
+
+Every generated link maps to that hackathon's pool only — participants who join through
+different links never see each other.
 
 ### Participant
 1. Open the organiser's link → `/start <event_code>`

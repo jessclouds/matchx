@@ -437,19 +437,122 @@ def test_stale_callback_data_does_not_crash(world, event):
 
 # ------------------------------------------------------------- organiser
 
-def test_organiser_creates_an_event_and_gets_a_link(world):
+def _event_code_from(text: str) -> str:
+    return text.split("?start=")[1].split()[0].strip()
+
+
+ANNOUNCEMENT = (
+    "IDEATE 2026 🚀\n"
+    "12–14 September, NUS Enterprise\n"
+    "Build health-tech in 48 hours. $5k prize pool & <mentors> from A*STAR.\n"
+    "Sign up: example.com/ideate"
+)
+
+
+def test_newevent_returns_the_announcement_unchanged_with_the_cta(world):
     organiser = Session(world, ORGANISER, "organiser")
     organiser.command("newevent")
     assert "announcement" in organiser.last.text.lower()
-    organiser.say("Quantum Hack 2026\nJoin us this weekend at NUS!")
 
-    text = organiser.last.text
-    assert "Quantum Hack 2026" in text and "?start=" in text
-    code = text.split("?start=")[1].split("<")[0].strip()
+    organiser.clear()
+    organiser.say(ANNOUNCEMENT)
+
+    post = organiser.inbox[0].text          # the ready-to-post message
+    plain = post.replace("<b>", "").replace("</b>", "")
+    plain = plain.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+
+    # The organiser's own words come back untouched, in order, at the top.
+    assert plain.startswith(ANNOUNCEMENT), plain
+    for line in ANNOUNCEMENT.splitlines():
+        assert line in plain
+
+    # …followed by exactly the MatchX call to action.
+    assert "🤝 Looking for teammates?" in plain
+    assert "complementary skills" in plain
+    assert "Find teammates: https://t.me/" in plain
+    assert "?start=" in plain
+
+    # Nothing operational is mixed into the copy-paste message.
+    for noise in ("copy the message above", "Event code:", "/myevents"):
+        assert noise not in post
+    assert "Event code:" in organiser.inbox[-1].text     # it lives in the follow-up
+
+    code = _event_code_from(post)
     world._created_events.append(code)
-    assert db.get_event(code) == "Quantum Hack 2026"
+    assert db.get_event(code) == "IDEATE 2026 🚀"
 
-    # A participant can join through exactly that link.
+
+def test_link_from_newevent_leads_into_that_events_pool_only(world):
+    organiser = Session(world, ORGANISER, "organiser")
+
+    organiser.command("newevent")
+    organiser.clear()
+    organiser.say("Alpha Hack\nFirst event")
+    code_a = _event_code_from(organiser.inbox[0].text)
+    world._created_events.append(code_a)
+
+    organiser.command("newevent")
+    organiser.clear()
+    organiser.say("Beta Hack\nSecond event")
+    code_b = _event_code_from(organiser.inbox[0].text)
+    world._created_events.append(code_b)
+
+    assert code_a != code_b
+
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, code_a, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, code_b, offers=("UI / UX",), needs=("Software",))
+
+    assert db.get_profile(ALICE, code_a) is not None
+    assert db.get_profile(ALICE, code_b) is None
+    assert [p.telegram_user_id for p in db.get_event_pool(code_a)] == [ALICE]
+    assert [p.telegram_user_id for p in db.get_event_pool(code_b)] == [BOB]
+
+    alice.clear()
+    alice.command("find")
+    assert "Potential teammate" not in alice.last.text
+
+
+def test_newevent_state_is_per_organiser(world):
+    """One organiser mid-flow must not swallow anyone else's messages."""
+    organiser = Session(world, ORGANISER, "organiser")
+    bystander = Session(world, CAROL, "carol")
+
+    organiser.command("newevent")
+
+    bystander.say("just chatting, definitely not an announcement")
+    assert "?start=" not in bystander.all_text()
+
+    organiser.clear()
+    organiser.say("Gamma Hack\nreal announcement")
+    assert "?start=" in organiser.inbox[0].text
+    world._created_events.append(_event_code_from(organiser.inbox[0].text))
+
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM events WHERE organiser_telegram_id = %s", (CAROL,))
+        assert cur.fetchone()["n"] == 0
+
+
+def test_second_message_after_newevent_is_not_another_event(world):
+    organiser = Session(world, ORGANISER, "organiser")
+    organiser.command("newevent")
+    organiser.clear()
+    organiser.say("Delta Hack\nannouncement")
+    world._created_events.append(_event_code_from(organiser.inbox[0].text))
+    organiser.clear()
+    organiser.say("oh and bring your laptop")
+    assert "?start=" not in organiser.all_text()
+
+
+def test_organiser_flow_end_to_end_with_myevents(world):
+    organiser = Session(world, ORGANISER, "organiser")
+    organiser.command("newevent")
+    organiser.clear()
+    organiser.say("Quantum Hack 2026\nJoin us this weekend at NUS!")
+    code = _event_code_from(organiser.inbox[0].text)
+    world._created_events.append(code)
+
     alice = Session(world, ALICE, "alice")
     onboard(alice, code)
     assert db.get_profile(ALICE, code) is not None

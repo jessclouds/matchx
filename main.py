@@ -883,35 +883,43 @@ async def newevent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await send(
         update,
         "📣 <b>Create a hackathon</b>\n\n"
-        "Forward or paste your hackathon announcement (the first line is used as the name).\n\n"
-        "I'll give you a unique <b>Find Teammates</b> link to share with participants.\n\n"
+        "Paste or forward your hackathon announcement (the first line becomes the name).\n\n"
+        "I'll send it straight back — unchanged — with a <b>Find Teammates</b> link added, "
+        "ready to copy-paste into your channel.\n\n"
         "Send /cancel to stop.",
     )
 
 
 @db_guard
 async def create_event_from_announcement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.pop("mode", None)
-    text = (update.message.text or update.message.caption or "").strip()
-    if not text:
-        await send(update, "I couldn't read any text there. Try /newevent again.")
+    """Turn a pasted/forwarded announcement into an isolated event pool + share link.
+
+    The reply is the organiser's announcement, unchanged, with the MatchX call-to-action
+    appended — so it can be copy-pasted straight into a hackathon channel.
+    """
+    context.user_data.pop("mode", None)          # state is per organiser (user_data)
+    announcement = (update.message.text or update.message.caption or "").strip()
+    if not announcement:
+        await send(update, "I couldn't read any text there. Send /newevent to try again.")
         return
 
-    name = next((line.strip() for line in text.splitlines() if line.strip()), "Hackathon")[:120]
-    event_code, event_name = await run_db(
-        db.create_event, name, text[:4000], update.effective_user.id
-    )
+    organiser_id = update.effective_user.id
+    name = next((line.strip() for line in announcement.splitlines() if line.strip()), "Hackathon")[:120]
+    event_code, event_name = await run_db(db.create_event, name, announcement[:4000], organiser_id)
     link = deep_link(event_code)
-    logger.info("Organiser %s created event %s", update.effective_user.id, event_code)
+    logger.info("Organiser %s created event %s", organiser_id, event_code)
 
+    # 1. The ready-to-post message — nothing else in it, so it pastes cleanly.
+    for part in kb.render_event_post(announcement, link):
+        await send(update, part)
+
+    # 2. Instructions, kept separate so they are not copied along with the post.
     await send(
         update,
-        f"✅ <b>{kb.esc(event_name)}</b> is live!\n\n"
-        f"🔗 <b>Find Teammates link</b>\n<code>{kb.esc(link)}</code>\n\n"
-        f"Event code: <code>{kb.esc(event_code)}</code>\n\n"
-        "Share that link in your participant chat. Everyone who joins through it is matched "
-        "only with people from this hackathon.\n\n"
-        "Use /myevents to see it again.",
+        f"☝️ <b>{kb.esc(event_name)}</b> is live — copy the message above and post it.\n\n"
+        f"Everyone who joins through that link is matched only with people from this "
+        f"hackathon.\n\n"
+        f"Event code: <code>{kb.esc(event_code)}</code>  ·  /myevents to see it again.",
     )
 
 
