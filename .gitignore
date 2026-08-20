@@ -12,5 +12,9 @@ __pycache__/
 # Pytest
 .pytest_cache/
 
+# Bot conversation state (rebuilt at runtime; all durable data lives in Postgres)
+bot_state.pickle
+*.pickle
+
 # macOS
 .DS_Store
