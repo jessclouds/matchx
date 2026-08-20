@@ -26,7 +26,7 @@ from telegram.ext import (
 
 import db
 import keyboards as kb
-from config import PERSISTENCE_FILE, deep_link, require_bot_token, setup_logging
+from config import PERSISTENCE_FILE, deep_link, may_create_events, require_bot_token, setup_logging
 from constants import (
     DISCIPLINES,
     HELP_TEXT,
@@ -869,6 +869,16 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def newevent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not may_create_events(user_id):
+        await send(
+            update,
+            "🔒 Creating hackathons is limited to organisers.\n\n"
+            f"Ask whoever runs this bot to add your Telegram ID <code>{user_id}</code> "
+            "to <code>ORGANISER_IDS</code>.",
+        )
+        return
+
     context.user_data["mode"] = "await_announcement"
     await send(
         update,

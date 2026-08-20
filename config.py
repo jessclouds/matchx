@@ -22,6 +22,21 @@ LOG_LEVEL: Final[str] = os.getenv("LOG_LEVEL", "INFO").upper()
 PERSISTENCE_FILE: Final[str] = os.getenv("PERSISTENCE_FILE", "bot_state.pickle")
 
 
+def _parse_ids(raw: str | None) -> frozenset[int]:
+    if not raw:
+        return frozenset()
+    return frozenset(int(part) for part in raw.replace(" ", "").split(",") if part.lstrip("-").isdigit())
+
+
+# Optional allow-list of Telegram user ids permitted to run /newevent.
+# Leave unset and anyone may create an event (fine for a pilot).
+ORGANISER_IDS: Final[frozenset[int]] = _parse_ids(os.getenv("ORGANISER_IDS"))
+
+
+def may_create_events(telegram_user_id: int) -> bool:
+    return not ORGANISER_IDS or telegram_user_id in ORGANISER_IDS
+
+
 def _clean_username(raw: str | None) -> str:
     """'@HackathonMatchBot' / 'https://t.me/x' -> bare username."""
     if not raw:

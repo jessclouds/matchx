@@ -51,6 +51,35 @@ skip automatically when `DATABASE_URL` / `BOT_TOKEN` are unset.
 
 ---
 
+## Running it somewhere that isn't your laptop
+
+The bot uses long polling, so it needs **no public URL, no webhook, no open port** —
+just a process that stays alive. While it is stopped, event links do nothing.
+
+Any always-on host works; the repo ships a `Dockerfile` and a `Procfile`.
+
+**Railway / Render / Fly.io (easiest):**
+1. Push this repo to GitHub
+2. Create a new project from the repo — the `Procfile` runs `python main.py` as a worker
+3. Add the environment variables `BOT_TOKEN`, `BOT_USERNAME`, `DATABASE_URL`
+   (and optionally `ORGANISER_IDS`) in the host's dashboard — never commit `.env`
+4. Deploy. The logs should show `Connected as @YourBot`
+
+The database is already hosted (Supabase), so nothing else moves.
+
+**Creating events without Telegram**
+
+```bash
+python newevent.py "IDEATE 2026"     # prints a ready-to-share link
+python newevent.py --list            # every event, its link and participant count
+```
+
+Handy for preparing links in advance, or handing an organiser a link without giving
+them bot access. Set `ORGANISER_IDS=<telegram id>,<telegram id>` to limit who may run
+`/newevent` inside Telegram; leave it unset and anyone can (fine for a pilot).
+
+---
+
 ## How the product works
 
 ### Organiser
