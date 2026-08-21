@@ -116,12 +116,14 @@ def edit_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def browse_keyboard(candidate_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Request match", callback_data=f"browse:req:{candidate_id}"),
-         InlineKeyboardButton("Skip", callback_data=f"browse:skip:{candidate_id}")],
-        [InlineKeyboardButton("Menu", callback_data="menu:home")],
-    ])
+def browse_keyboard(candidate_id: int, can_go_back: bool = False) -> InlineKeyboardMarkup:
+    """Back is omitted entirely when there is nothing to go back to."""
+    row = []
+    if can_go_back:
+        row.append(InlineKeyboardButton("← Back", callback_data="browse:back"))
+    row.append(InlineKeyboardButton("Request Match", callback_data=f"browse:req:{candidate_id}"))
+    row.append(InlineKeyboardButton("Next →", callback_data=f"browse:next:{candidate_id}"))
+    return InlineKeyboardMarkup([row, [InlineKeyboardButton("Menu", callback_data="menu:home")]])
 
 
 def request_response_keyboard(requester_id: int) -> InlineKeyboardMarkup:
@@ -131,8 +133,11 @@ def request_response_keyboard(requester_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def no_candidates_keyboard(has_skips: bool) -> InlineKeyboardMarkup:
+def no_candidates_keyboard(has_skips: bool, can_go_back: bool = False) -> InlineKeyboardMarkup:
+    """End of the pool: never a dead end — Back returns to the last card seen."""
     rows: list[list[InlineKeyboardButton]] = []
+    if can_go_back:
+        rows.append([InlineKeyboardButton("← Back", callback_data="browse:back")])
     if has_skips:
         rows.append([InlineKeyboardButton("Review people I skipped", callback_data="browse:reset")])
     rows.append([InlineKeyboardButton("Edit profile", callback_data="menu:edit"),
@@ -148,7 +153,12 @@ def event_picker_keyboard(events: list[dict]) -> InlineKeyboardMarkup:
 # ------------------------------------------------------------------- rendering
 
 def esc(value: object) -> str:
-    return html.escape(str(value if value is not None else ""))
+    """Escape for Telegram's HTML parse mode.
+
+    Telegram only understands &lt; &gt; &amp;, so quotes must be left alone —
+    escaping them would print a literal &#x27; in an event name like "Jess's Hack".
+    """
+    return html.escape(str(value if value is not None else ""), quote=False)
 
 
 def render_profile(profile: Profile, event_name: str) -> str:
@@ -184,10 +194,29 @@ def _candidate_body(candidate: ScoredCandidate) -> str:
     return "\n".join(lines)
 
 
-def render_candidate(candidate: ScoredCandidate, remaining: int) -> str:
-    """A candidate card. No name, no @username — those appear only after a mutual yes."""
-    tail = f" · {remaining} more in your queue" if remaining > 0 else " · last one for now"
-    return f"Potential teammate{tail}\n\n{_candidate_body(candidate)}"
+REVISIT_NOTES = {
+    "pending": "You've already sent them a request — waiting for their answer.",
+    "matched": "You're already matched with them.",
+    "skipped": "You skipped this one earlier.",
+    "declined": "They declined this one.",
+    "incoming": "They've asked to team up with you — check your matches to answer.",
+}
+
+
+def render_candidate(candidate: ScoredCandidate, remaining: int | None = None, note: str = "") -> str:
+    """A candidate card. No name, no @username — those appear only after a mutual yes.
+
+    `remaining` is the size of the live queue; None marks a card reached with Back.
+    """
+    if remaining is None:
+        tail = " · seen earlier"
+    elif remaining > 0:
+        tail = f" · {remaining} more in your queue"
+    else:
+        tail = " · last one for now"
+
+    card = f"Potential teammate{tail}\n\n{_candidate_body(candidate)}"
+    return f"{card}\n\n{note}" if note else card   # notes are our own copy
 
 
 def render_request_card(requester: ScoredCandidate, event_name: str) -> str:

@@ -156,3 +156,28 @@ def test_ranking_is_stable_by_score_despite_shuffle():
     weak = make(3, offers=("uiux",), needs=("healthcare",))
     for seed in range(20):
         assert ids(rank_candidates(me, [weak, strong], rng=random.Random(seed))) == [2, 3]
+
+
+# ------------------------------------------------------- HTML escaping
+
+def test_escaping_leaves_quotes_alone_but_neutralises_tags():
+    """Telegram's HTML mode only knows &lt; &gt; &amp; — an escaped quote would show raw."""
+    import keyboards as kb
+
+    assert kb.esc("Jess's Hack") == "Jess's Hack"
+    assert kb.esc('The "Big" Hack') == 'The "Big" Hack'
+    assert kb.esc("A & B") == "A &amp; B"
+    assert kb.esc("<b>bold</b>") == "&lt;b&gt;bold&lt;/b&gt;"
+    assert kb.esc(None) == ""
+
+
+def test_profile_card_escapes_injected_markup():
+    import keyboards as kb
+    from matching import Profile
+
+    nasty = Profile(1, "e", "user", "<script>NUS</script>", "none", "comp", "looking",
+                    ("software",), ("uiux",))
+    rendered = kb.render_profile(nasty, "Jess's Hack")
+    assert "<script>" not in rendered
+    assert "&lt;script&gt;" in rendered
+    assert "Jess's Hack" in rendered

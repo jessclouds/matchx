@@ -169,6 +169,12 @@ def main_check() -> int:
 
         ada.command("find")
         check("no candidates left is handled gracefully", "Potential teammate" not in ada.last.text)
+        check("the end of the pool still offers Back", ada.has_button("Back"))
+
+        step("9. Back navigation")
+        ada.tap("Back")
+        check("Back re-shows the teammate seen before", "seen earlier" in ada.last.text)
+        check("Back did not undo the match", len(db.get_matches(ADA, event_code)) == 1)
         show("Ada", ada)
 
     finally:

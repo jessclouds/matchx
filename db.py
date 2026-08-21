@@ -680,3 +680,38 @@ if __name__ == "__main__":
             print(f"  {row['event_code']:<24} {row['name']}")
         cur.execute("SELECT count(*) AS n FROM profiles")
         print(f"  profiles: {cur.fetchone()['n']}")
+
+
+def interaction_status(event_code: str, from_user_id: int, to_user_id: int) -> str:
+    """Read-only: how these two already stand. One of
+
+    'matched', 'pending', 'declined', 'skipped', 'incoming', 'none'.
+    Used to label a candidate the user has navigated back to; changes nothing.
+    """
+
+    def q(cur: psycopg.Cursor) -> str:
+        cur.execute(
+            "SELECT 1 FROM matches WHERE event_code = %s AND user_a = %s AND user_b = %s",
+            (event_code, *sorted((from_user_id, to_user_id))),
+        )
+        if cur.fetchone():
+            return "matched"
+
+        cur.execute(
+            "SELECT status FROM interests WHERE event_code = %s AND from_user_id = %s AND to_user_id = %s",
+            (event_code, from_user_id, to_user_id),
+        )
+        row = cur.fetchone()
+        if row:
+            return row["status"]
+
+        cur.execute(
+            """
+            SELECT 1 FROM interests
+            WHERE event_code = %s AND from_user_id = %s AND to_user_id = %s AND status = 'pending'
+            """,
+            (event_code, to_user_id, from_user_id),
+        )
+        return "incoming" if cur.fetchone() else "none"
+
+    return _run(q)

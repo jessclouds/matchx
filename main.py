@@ -508,6 +508,41 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # ------------------------------------------------------------------- browsing
 
+# Browsing history is per user and per event, kept in user_data (persisted by
+# PicklePersistence). It is navigation state only — nothing here creates, removes
+# or alters a skip, request or match.
+MAX_HISTORY = 50
+
+
+def _history(context: ContextTypes.DEFAULT_TYPE, event_code: str) -> list[int]:
+    return context.user_data.setdefault("history", {}).setdefault(event_code, [])
+
+
+def _cursor(context: ContextTypes.DEFAULT_TYPE, event_code: str) -> int:
+    """Index of the card on screen; len(history) means the end-of-pool message."""
+    history = _history(context, event_code)
+    return context.user_data.setdefault("cursor", {}).get(event_code, len(history))
+
+
+def _set_cursor(context: ContextTypes.DEFAULT_TYPE, event_code: str, value: int) -> None:
+    context.user_data.setdefault("cursor", {})[event_code] = value
+
+
+def _remember(context: ContextTypes.DEFAULT_TYPE, event_code: str, candidate_id: int) -> None:
+    history = _history(context, event_code)
+    if not history or history[-1] != candidate_id:
+        history.append(candidate_id)
+        del history[:-MAX_HISTORY]
+    _set_cursor(context, event_code, len(history) - 1)
+
+
+def _current_candidate_id(context: ContextTypes.DEFAULT_TYPE, event_code: str) -> int | None:
+    history = _history(context, event_code)
+    cursor = _cursor(context, event_code)
+    return history[cursor] if 0 <= cursor < len(history) else None
+
+
+
 
 @db_guard
 async def find_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -552,16 +587,57 @@ async def find_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         else:
             text = ("You're one of the first here.\n\n"
                     "I'll have candidates as soon as more teammates sign up — check back soon.")
-        await send(update, text, reply_markup=kb.no_candidates_keyboard(bool(skipped)))
+        _set_cursor(context, profile.event_code, len(_history(context, profile.event_code)))
+        await send(
+            update,
+            text,
+            reply_markup=kb.no_candidates_keyboard(
+                bool(skipped),
+                can_go_back=bool(_history(context, profile.event_code)),
+            ),
+        )
         return
 
     best = ranked[0]
+    _remember(context, profile.event_code, best.profile.telegram_user_id)
     await send(
         update,
         kb.render_candidate(best, remaining=len(ranked) - 1),
-        reply_markup=kb.browse_keyboard(best.profile.telegram_user_id),
+        reply_markup=kb.browse_keyboard(
+            best.profile.telegram_user_id,
+            can_go_back=_cursor(context, profile.event_code) > 0,
+        ),
     )
 
+
+
+
+async def show_previous_candidate(update: Update, context: ContextTypes.DEFAULT_TYPE, me: Profile) -> bool:
+    """Re-show the card before the current one. Returns False when there is none.
+
+    Purely navigational: it never touches interests or matches, so a request already
+    sent — or a match already made — stays exactly as it is.
+    """
+    history = _history(context, me.event_code)
+    index = _cursor(context, me.event_code) - 1
+
+    while index >= 0:
+        candidate_id = history[index]
+        other = await run_db(db.get_profile, candidate_id, me.event_code)
+        if other and other.is_matchable and candidate_id != me.telegram_user_id:
+            status = await run_db(db.interaction_status, me.event_code, me.telegram_user_id, candidate_id)
+            _set_cursor(context, me.event_code, index)
+            await send(
+                update,
+                kb.render_candidate(score(me, other), note=kb.REVISIT_NOTES.get(status, "")),
+                reply_markup=kb.browse_keyboard(candidate_id, can_go_back=index > 0),
+            )
+            return True
+        del history[index]          # they left the pool — drop them from history
+        index -= 1
+
+    _set_cursor(context, me.event_code, 0)
+    return False
 
 @db_guard
 async def handle_browse_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -582,27 +658,34 @@ async def handle_browse_action(update: Update, context: ContextTypes.DEFAULT_TYP
         await find_matches(update, context)
         return
 
-    if action == "next":
+    if action == "back":
         await query.answer()
-        await find_matches(update, context)
+        # Leave the card being stepped away from in place, but without live buttons.
+        await safe_edit(query, reply_markup=None)
+        if not await show_previous_candidate(update, context, profile):
+            await send(update, "That's the first teammate you've seen.")
+            await find_matches(update, context)
         return
 
     try:
         candidate_id = int(parts[2])
     except (IndexError, ValueError):
-        await query.answer("That button expired — here's the next teammate.", show_alert=False)
-        await find_matches(update, context)
-        return
+        # Older button, or a plain "next" with nothing to skip.
+        candidate_id = _current_candidate_id(context, profile.event_code) if action == "next" else None
+        if candidate_id is None:
+            await query.answer()
+            await find_matches(update, context)
+            return
 
     if candidate_id == profile.telegram_user_id:
         await query.answer()
         await find_matches(update, context)
         return
 
-    if action == "skip":
-        await query.answer("Skipped")
+    if action in ("next", "skip"):
+        await query.answer()
         await run_db(db.record_skip, profile.telegram_user_id, profile.event_code, candidate_id)
-        await safe_edit(query, "Skipped.")
+        await safe_edit(query, "Seen.")
         await find_matches(update, context)
         return
 

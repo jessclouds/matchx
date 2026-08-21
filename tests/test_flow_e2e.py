@@ -58,6 +58,12 @@ def event(world):
     return code
 
 
+def _shown_candidate_id(world: World, event_code: str) -> int:
+    """The candidate the bot currently has on screen, from its own browsing state."""
+    cursor = world.user_data[ALICE]["cursor"][event_code]
+    return world.user_data[ALICE]["history"][event_code][cursor]
+
+
 def onboard(session: Session, event_code: str, *, school="NUS", pref="No preference",
             discipline="Computing", status="Solo", offers=("Software",), needs=("UI / UX",)):
     """Walk one user through the whole questionnaire by tapping real buttons."""
@@ -205,7 +211,7 @@ def test_candidate_card_hides_identity(world, event):
     assert "Potential teammate" in card
     assert "bob" not in card.lower(), "usernames must stay hidden before a mutual yes"
     assert "Offers" in card and "Matches your needs" in card
-    assert alice.has_button("Request match") and alice.has_button("Skip")
+    assert alice.has_button("Request Match") and alice.has_button("Next")
 
 
 def test_incompatible_users_are_not_recommended(world, event):
@@ -219,7 +225,7 @@ def test_incompatible_users_are_not_recommended(world, event):
     assert "match" in alice.last.text.lower() or "check back" in alice.last.text.lower()
 
 
-def test_skip_moves_on_and_can_be_undone(world, event):
+def test_next_moves_on_and_skips_can_be_undone(world, event):
     alice = Session(world, ALICE, "alice")
     bob = Session(world, BOB, "bob")
     onboard(alice, event, offers=("Software",), needs=("UI / UX",))
@@ -227,12 +233,190 @@ def test_skip_moves_on_and_can_be_undone(world, event):
 
     alice.clear()
     alice.command("find")
-    alice.tap("Skip")
+    alice.tap("Next")
     assert db.get_skipped_user_ids(ALICE, event) == {BOB}
     assert "Potential teammate" not in alice.last.text
     assert alice.has_button("skipped")
     alice.tap("Review people I skipped")
     assert "Potential teammate" in alice.last.text
+
+
+# ------------------------------------------------------------ back navigation
+
+def _three_candidates(world, event):
+    """Alice plus three teammates she is eligible to see."""
+    alice = Session(world, ALICE, "alice")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    for uid, username in ((BOB, "bob"), (CAROL, "carol"), (DAVE, "dave")):
+        db.save_profile(uid, event, username, "NUS", "none", "design", "looking",
+                        ["uiux"], ["software"], False)
+    alice.clear()
+    return alice
+
+
+def test_back_is_hidden_until_there_is_history(world, event):
+    alice = _three_candidates(world, event)
+    alice.command("find")
+    assert "Potential teammate" in alice.last.text
+    assert alice.has_button("Request Match") and alice.has_button("Next")
+    assert not alice.has_button("Back"), "nothing to go back to on the first card"
+
+
+def test_next_then_back_returns_to_the_previous_candidate(world, event):
+    alice = _three_candidates(world, event)
+    alice.command("find")
+    first = _shown_candidate_id(world, event)
+
+    alice.tap("Next")
+    second = _shown_candidate_id(world, event)
+    assert second != first
+    assert alice.has_button("Back")
+
+    alice.tap("Back")
+    assert _shown_candidate_id(world, event) == first
+    assert "seen earlier" in alice.last.text
+    assert "Potential teammate" in alice.last.text
+
+
+def test_multiple_back_and_next_steps(world, event):
+    alice = _three_candidates(world, event)
+    alice.command("find")
+    first = _shown_candidate_id(world, event)
+    alice.tap("Next")
+    second = _shown_candidate_id(world, event)
+    alice.tap("Next")
+    third = _shown_candidate_id(world, event)
+    assert len({first, second, third}) == 3
+
+    alice.tap("Back")
+    assert _shown_candidate_id(world, event) == second
+    alice.tap("Back")
+    assert _shown_candidate_id(world, event) == first
+    assert not alice.has_button("Back"), "Back must disappear at the start of history"
+
+    alice.tap("Next")            # forward again from the oldest card
+    assert "Potential teammate" in alice.last.text
+
+
+def test_back_does_not_undo_a_sent_request(world, event):
+    alice = _three_candidates(world, event)
+    alice.command("find")
+    target = _shown_candidate_id(world, event)
+    alice.tap("Request Match")
+    assert [p.telegram_user_id for p in db.get_outgoing_requests(ALICE, event)] == [target]
+
+    alice.tap("Back")
+    assert _shown_candidate_id(world, event) == target
+    assert "already sent them a request" in alice.last.text
+    assert [p.telegram_user_id for p in db.get_outgoing_requests(ALICE, event)] == [target]
+
+
+def test_back_does_not_undo_a_confirmed_match(world, event):
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",))
+    db.save_profile(CAROL, event, "carol", "NUS", "none", "design", "looking",
+                    ["uiux"], ["software"], False)
+
+    alice.clear()
+    alice.command("find")
+    while _shown_candidate_id(world, event) != BOB:
+        alice.tap("Next")
+    alice.tap("Request Match")
+    bob.tap("Accept")
+    assert len(db.get_matches(ALICE, event)) == 1
+
+    alice.tap("Back") if alice.has_button("Back") else None
+    assert len(db.get_matches(ALICE, event)) == 1
+    assert [p.telegram_user_id for p in db.get_matches(ALICE, event)] == [BOB]
+
+
+def test_can_request_someone_after_going_back_to_them(world, event):
+    alice = _three_candidates(world, event)
+    alice.command("find")
+    skipped = _shown_candidate_id(world, event)
+    alice.tap("Next")                       # skipped is now recorded as skipped
+    assert skipped in db.get_skipped_user_ids(ALICE, event)
+
+    alice.tap("Back")
+    assert _shown_candidate_id(world, event) == skipped
+    assert "skipped this one earlier" in alice.last.text
+    alice.tap("Request Match")
+    assert [p.telegram_user_id for p in db.get_outgoing_requests(ALICE, event)] == [skipped]
+
+
+def test_repeated_back_and_request_taps_create_no_duplicates(world, event):
+    alice = _three_candidates(world, event)
+    alice.command("find")
+    target = _shown_candidate_id(world, event)
+
+    msg, button = alice.find_button("Request Match")
+    alice.tap_data(button.callback_data, msg)
+    alice.tap_data(button.callback_data, msg)      # same stale button, twice more
+    alice.tap_data(button.callback_data, msg)
+
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM interests WHERE event_code = %s AND from_user_id = %s",
+                    (event, ALICE))
+        assert cur.fetchone()["n"] == 1
+    assert [p.telegram_user_id for p in db.get_outgoing_requests(ALICE, event)] == [target]
+
+    back_msg, back_button = alice.find_button("Back") if alice.has_button("Back") else (None, None)
+    if back_button:
+        alice.tap_data(back_button.callback_data, back_msg)
+        alice.tap_data(back_button.callback_data, back_msg)
+    assert len(db.get_matches(ALICE, event)) == 0
+
+
+def test_back_at_the_end_of_the_pool(world, event):
+    alice = _three_candidates(world, event)
+    alice.command("find")
+    for _ in range(3):
+        alice.tap("Next")
+    assert "Potential teammate" not in alice.last.text        # end-of-pool message
+    assert alice.has_button("Back"), "the end of the pool must not be a dead end"
+
+    alice.tap("Back")
+    assert "Potential teammate" in alice.last.text
+    assert "seen earlier" in alice.last.text
+
+
+def test_back_history_is_scoped_to_the_user_and_event(world, event):
+    other_code, _ = db.create_event(f"E2E Back {uuid.uuid4().hex[:6]}", None, ORGANISER)
+    world._created_events.append(other_code)
+
+    alice = _three_candidates(world, event)
+    alice.command("find")
+    alice.tap("Next")
+    assert alice.has_button("Back")
+
+    # Same person, different hackathon: history starts empty again.
+    onboard(alice, other_code, offers=("Software",), needs=("UI / UX",))
+    db.save_profile(BOB, other_code, "bob", "NUS", "none", "design", "looking",
+                    ["uiux"], ["software"], False)
+    alice.clear()
+    alice.command("find")
+    assert "Potential teammate" in alice.last.text
+    assert not alice.has_button("Back"), "history must not leak between events"
+
+    # And another user in the first event has their own empty history.
+    bob = Session(world, BOB, "bob")
+    bob.clear()
+    bob.command("find")
+    assert not bob.has_button("Back")
+
+
+def test_back_skips_people_who_left_the_pool(world, event):
+    alice = _three_candidates(world, event)
+    alice.command("find")
+    first = _shown_candidate_id(world, event)
+    alice.tap("Next")
+    db.set_active(first, event, False)           # they paused after being seen
+
+    alice.tap("Back")
+    shown = _shown_candidate_id(world, event)
+    assert shown != first, "a paused teammate must not be re-shown"
 
 
 # ------------------------------------------------------------ mutual match
@@ -245,7 +429,7 @@ def test_request_then_accept_reveals_usernames_to_both(world, event):
 
     alice.clear(); bob.clear()
     alice.command("find")
-    alice.tap("Request match")
+    alice.tap("Request Match")
 
     # One-sided interest: no match yet, and no contact details anywhere.
     assert db.get_matches(ALICE, event) == []
@@ -270,7 +454,7 @@ def test_double_tapping_accept_is_safe(world, event):
     onboard(alice, event, offers=("Software",), needs=("UI / UX",))
     onboard(bob, event, offers=("UI / UX",), needs=("Software",))
     alice.command("find")
-    alice.tap("Request match")
+    alice.tap("Request Match")
 
     msg, button = bob.find_button("Accept")
     bob.tap_data(button.callback_data, msg)
@@ -289,7 +473,7 @@ def test_decline_keeps_the_requester_anonymous(world, event):
     onboard(alice, event, offers=("Software",), needs=("UI / UX",))
     onboard(bob, event, offers=("UI / UX",), needs=("Software",))
     alice.command("find")
-    alice.tap("Request match")
+    alice.tap("Request Match")
     alice.clear()
     bob.tap("Decline")
     assert "Declined" in bob.last.text
@@ -304,7 +488,7 @@ def test_reciprocal_requests_match_without_anyone_accepting(world, event):
     onboard(bob, event, offers=("UI / UX",), needs=("Software",))
 
     alice.command("find")
-    alice.tap("Request match")
+    alice.tap("Request Match")
     bob.clear()
     bob.command("find")          # Bob has a pending request from Alice, so she is hidden…
     assert "Potential teammate" not in bob.last.text
@@ -322,7 +506,7 @@ def test_matches_screen_lists_contacts_and_pending(world, event):
     onboard(carol, event, offers=("UI / UX",), needs=("Software",))
 
     alice.command("find")
-    alice.tap("Request match")
+    alice.tap("Request Match")
     other = bob if bob.inbox and "wants to team up" in bob.all_text() else carol
     other.tap("Accept")
 
@@ -657,7 +841,7 @@ def test_blocked_recipient_does_not_break_the_requester(world, event, monkeypatc
 
     alice.clear()
     alice.command("find")
-    alice.tap("Request match")
+    alice.tap("Request Match")
     assert "Request sent" in alice.all_text()
     assert [p.telegram_user_id for p in db.get_incoming_requests(BOB, event)] == [ALICE]
 

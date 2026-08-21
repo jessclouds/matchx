@@ -106,7 +106,9 @@ different links never see each other.
    pool for &lt;hackathon name&gt;"* so they can check they're in the right pool.
    Participants never type or pick an event code; the link carries it.
 2. Six questions: school → school preference → discipline → team status → skills offered → skills needed
-3. Browse candidates one at a time: **🤝 Request match** or **⏭ Skip**
+3. Browse candidates one at a time: **← Back**, **Request Match**, **Next →**
+   (Back re-shows the previous card — it never undoes a request or a match, and you
+   can request someone you had already passed on)
 4. A request pushes your (anonymous) card straight to that person — they never have to
    stumble across you while browsing
 5. They **✅ Accept** or **🚫 Decline**. On accept, both sides get the other's `@username`
