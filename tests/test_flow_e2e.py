@@ -878,3 +878,130 @@ def test_database_outage_during_a_button_tap_only_alerts(world, event, monkeypat
     assert "database" in alice.last.text.lower(), alice.debug()
     assert "connection refused" not in alice.all_text()
     assert alice.has_button("Menu")
+
+
+# ---------------------------------------------------- closed events & limits
+
+def test_closed_event_refuses_new_participants(world, event):
+    db.set_event_active(event, False)
+    try:
+        alice = Session(world, ALICE, "alice")
+        alice.command("start", event)
+        assert "closed" in alice.last.text.lower()
+        assert not alice.has_button("NUS"), "onboarding must not start for a closed event"
+        assert db.get_profile(ALICE, event) is None
+    finally:
+        db.set_event_active(event, True)
+
+
+def test_closed_event_tells_existing_participants(world, event):
+    alice = Session(world, ALICE, "alice")
+    onboard(alice, event)
+    db.set_event_active(event, False)
+    try:
+        alice.clear()
+        alice.command("find")
+        assert "closed" in alice.last.text.lower()
+        assert "/matches" in alice.last.text
+        assert alice.has_button("Menu")
+    finally:
+        db.set_event_active(event, True)
+
+
+def test_callback_spam_is_rate_limited(world, event, monkeypatch):
+    """A burst of taps from one user is throttled, without corrupting anything."""
+    import main
+
+    monkeypatch.setattr(main, "_MAX_ACTIONS_PER_WINDOW", 3)
+
+    alice = _three_candidates(world, event)
+    alice.command("find")
+    msg, button = alice.find_button("Next")
+
+    alerts = []
+    for _ in range(6):
+        query = alice.tap_data(button.callback_data, msg)
+        alerts.extend(text for text, alert in query.answers if alert and text)
+
+    assert any("Slow down" in text for text in alerts), "callback spam should be throttled"
+    assert db.get_profile(ALICE, event) is not None, "throttling must not corrupt state"
+
+
+def test_request_flood_is_rate_limited(world, event, monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "_MAX_REQUESTS_PER_WINDOW", 1)
+
+    alice = _three_candidates(world, event)
+    alice.command("find")
+    msg, button = alice.find_button("Request Match")
+
+    alerts = []
+    for _ in range(3):
+        query = alice.tap_data(button.callback_data, msg)
+        alerts.extend(text for text, alert in query.answers if alert and text)
+
+    assert any("lot of requests" in text for text in alerts)
+
+
+def test_rate_limit_window_counts_only_recent_actions():
+    """Unit test for the guard itself, independent of any Telegram or DB timing."""
+    import main
+
+    main._recent_actions.clear()
+    user = 12345
+    assert not any(main._too_many(user, 3) for _ in range(3))
+    assert main._too_many(user, 3), "the fourth action in the window is throttled"
+
+    # Actions older than the window are forgotten.
+    main._recent_actions[user] = [main.time.monotonic() - main._ACTION_WINDOW_SECONDS - 1] * 10
+    assert not main._too_many(user, 3)
+    main._recent_actions.clear()
+
+
+# ------------------------------------------------------------- restart safety
+
+def test_everything_survives_a_bot_restart(world, application, event):
+    """A restart wipes in-memory state; profiles, requests and matches must remain."""
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",))
+    alice.command("find")
+    alice.tap("Request Match")
+    assert [p.telegram_user_id for p in db.get_incoming_requests(BOB, event)] == [ALICE]
+
+    # A brand-new World has empty user_data and bot_data — exactly like a restarted bot.
+    restarted = World(application)
+    alice2 = Session(restarted, ALICE, "alice")
+    bob2 = Session(restarted, BOB, "bob")
+
+    alice2.command("start")                       # no deep link, no remembered state
+    assert "Welcome back" in alice2.all_text(), alice2.debug()
+
+    bob2.command("matches")                       # the pending request is still there
+    assert "wants to team up" in bob2.all_text()
+    bob2.tap("Accept")
+
+    assert [p.telegram_username for p in db.get_matches(ALICE, event)] == ["bob"]
+    assert [p.telegram_username for p in db.get_matches(BOB, event)] == ["alice"]
+    assert "It's a match" in alice2.all_text(), "the requester is notified after a restart"
+
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM matches WHERE event_code = %s", (event,))
+        assert cur.fetchone()["n"] == 1
+
+
+def test_browsing_position_resets_harmlessly_after_restart(world, application, event):
+    alice = _three_candidates(world, event)
+    alice.command("find")
+    alice.tap("Next")
+    assert alice.has_button("Back")
+
+    restarted = World(application)
+    alice2 = Session(restarted, ALICE, "alice")
+    alice2.command("find")
+    assert "Potential teammate" in alice2.last.text
+    assert not alice2.has_button("Back"), "history is navigation state; it may reset"
+    # The durable part — who was skipped — is unaffected.
+    assert db.get_skipped_user_ids(ALICE, event)

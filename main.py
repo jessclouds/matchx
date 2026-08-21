@@ -9,12 +9,14 @@ mutual yes.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Awaitable, Callable
 
 from telegram import BotCommand, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import BadRequest, Conflict, Forbidden, TelegramError
 from telegram.ext import (
+    AIORateLimiter,
     Application,
     CallbackQueryHandler,
     CommandHandler,
@@ -132,9 +134,15 @@ async def current_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return profile
 
 
+EVENT_NAME_CACHE_SIZE = 500
+
+
 async def event_name_for(context: ContextTypes.DEFAULT_TYPE, event_code: str) -> str:
+    """Event names never change, so cache them — bounded, so it cannot grow forever."""
     cache = context.bot_data.setdefault("event_names", {})
     if event_code not in cache:
+        if len(cache) >= EVENT_NAME_CACHE_SIZE:
+            cache.clear()
         cache[event_code] = await run_db(db.get_event, event_code) or event_code
     return cache[event_code]
 
@@ -171,6 +179,32 @@ def db_guard(handler: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable
     return wrapper
 
 
+# --------------------------------------------------------------- abuse guard
+
+# A single bot process, so a bounded in-memory window is enough: it costs nothing,
+# survives nothing (which is fine for spam control) and cannot grow without limit.
+_ACTION_WINDOW_SECONDS = 60
+_MAX_ACTIONS_PER_WINDOW = 40
+_MAX_REQUESTS_PER_WINDOW = 15
+_recent_actions: dict[int, list[float]] = {}
+
+
+def _too_many(user_id: int, limit: int) -> bool:
+    """True when this user has exceeded `limit` actions in the last minute."""
+    now = time.monotonic()
+    hits = [stamp for stamp in _recent_actions.get(user_id, ()) if now - stamp < _ACTION_WINDOW_SECONDS]
+    hits.append(now)
+    _recent_actions[user_id] = hits
+
+    if len(_recent_actions) > 5000:            # keep the dict bounded
+        for stale_id in [
+            uid for uid, stamps in _recent_actions.items()
+            if not stamps or now - stamps[-1] > _ACTION_WINDOW_SECONDS
+        ][:2000]:
+            _recent_actions.pop(stale_id, None)
+
+    return len(hits) > limit
+
 # ------------------------------------------------------------------ main menu
 
 
@@ -181,16 +215,17 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, intro: s
         return
 
     event_name = await event_name_for(context, profile.event_code)
-    matches = await run_db(db.get_matches, profile.telegram_user_id, profile.event_code)
-    pending = await run_db(db.get_incoming_requests, profile.telegram_user_id, profile.event_code)
+    match_count, pending_count = await run_db(
+        db.menu_counts, profile.telegram_user_id, profile.event_code
+    )
 
     lines = [intro] if intro else []
     lines.append(f"<b>{kb.esc(event_name)}</b>")
-    if pending:
-        lines.append(f"{len(pending)} request{'s' if len(pending) > 1 else ''} waiting for your answer.")
+    if pending_count:
+        lines.append(f"{pending_count} request{'s' if pending_count > 1 else ''} waiting for your answer.")
     lines.append("What would you like to do?")
 
-    await send(update, "\n\n".join(lines), reply_markup=kb.main_menu_keyboard(len(matches), len(pending)))
+    await send(update, "\n\n".join(lines), reply_markup=kb.main_menu_keyboard(match_count, pending_count))
 
 
 @db_guard
@@ -213,9 +248,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await no_profile_prompt(update)
         return
 
-    event_name = await run_db(db.get_event, event_code)
-    if event_name is None:
+    event = await run_db(db.get_event_row, event_code)
+    if event is None:
         await send(update, "I don't recognise that event code. Check the link with your organiser.")
+        profile = await current_profile(update, context)
+        if profile:
+            await show_menu(update, context)
+        return
+
+    event_name = event["name"]
+    if not event["is_active"]:
+        await send(update, f"<b>{kb.esc(event_name)}</b> has closed, so it's no longer matching teammates.")
         profile = await current_profile(update, context)
         if profile:
             await show_menu(update, context)
@@ -513,6 +556,10 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # or alters a skip, request or match.
 MAX_HISTORY = 50
 
+# Candidates are fetched a page at a time. The page is ordered by the same keys the
+# ranker uses, so the best candidate is always inside it.
+CANDIDATE_PAGE = 25
+
 
 def _history(context: ContextTypes.DEFAULT_TYPE, event_code: str) -> list[int]:
     return context.user_data.setdefault("history", {}).setdefault(event_code, [])
@@ -566,13 +613,24 @@ async def find_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     user_id = profile.telegram_user_id
-    pool = await run_db(db.get_event_pool, profile.event_code)
-    seen = await run_db(db.get_interacted_user_ids, user_id, profile.event_code)
-    ranked = rank_candidates(profile, pool, exclude_user_ids=seen)
+    # Postgres applies the hard filters and returns one page, so browsing costs a
+    # single indexed query no matter how large the event gets.
+    page = await run_db(db.find_candidates, profile, CANDIDATE_PAGE + 1)
+    ranked = rank_candidates(profile, page[:CANDIDATE_PAGE])
 
     if not ranked:
-        skipped = await run_db(db.get_skipped_user_ids, user_id, profile.event_code)
-        others = [p for p in pool if p.telegram_user_id != user_id]
+        event = await run_db(db.get_event_row, profile.event_code)
+        if event and not event["is_active"]:
+            await send(
+                update,
+                f"<b>{kb.esc(event['name'])}</b> has closed. Your matches are still in /matches.",
+                reply_markup=kb.home_keyboard(),
+            )
+            return
+
+        skipped = await run_db(db.count_skipped, profile.event_code, user_id)
+        seen = await run_db(db.count_interactions, profile.event_code, user_id)
+        others = await run_db(db.count_active_others, profile.event_code, user_id)
         if skipped:
             text = ("That's everyone new for now.\n\n"
                     "You can look again at the people you skipped, or widen what you're "
@@ -599,10 +657,11 @@ async def find_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     best = ranked[0]
+    remaining = len(page) - 1                      # len(page) may be CANDIDATE_PAGE + 1
     _remember(context, profile.event_code, best.profile.telegram_user_id)
     await send(
         update,
-        kb.render_candidate(best, remaining=len(ranked) - 1),
+        kb.render_candidate(best, remaining=remaining, capped=len(page) > CANDIDATE_PAGE),
         reply_markup=kb.browse_keyboard(
             best.profile.telegram_user_id,
             can_go_back=_cursor(context, profile.event_code) > 0,
@@ -644,6 +703,10 @@ async def handle_browse_action(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     parts = query.data.split(":")
     action = parts[1]
+
+    if _too_many(update.effective_user.id, _MAX_ACTIONS_PER_WINDOW):
+        await query.answer("Slow down a moment — try again shortly.", show_alert=True)
+        return
 
     profile = await current_profile(update, context)
     if not profile:
@@ -701,6 +764,9 @@ async def handle_request(
 ) -> None:
     """Request Match: push my card to the recipient so they can answer."""
     query = update.callback_query
+    if _too_many(me.telegram_user_id, _MAX_REQUESTS_PER_WINDOW):
+        await query.answer("That's a lot of requests at once — try again in a minute.", show_alert=True)
+        return
     other = await run_db(db.get_profile, candidate_id, me.event_code)
     if not other:
         await query.answer("That teammate is no longer available.", show_alert=True)
@@ -1083,6 +1149,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, Conflict):
+        # Another poller holds this token — usually the previous process still
+        # shutting down. main() waits and takes over instead of dying.
+        global _conflict_seen
+        _conflict_seen = True
+        logger.warning("Another instance is polling this bot token.")
+        return
+
     logger.exception("Unhandled error while processing update", exc_info=context.error)
     if isinstance(update, Update):
         if update.callback_query:
@@ -1123,6 +1197,10 @@ def build_application() -> Application:
     application = (
         Application.builder()
         .token(TOKEN)
+        # Queues and retries outgoing calls so a burst of matches never trips
+        # Telegram's flood limits (30 messages/second overall, 1/second per chat).
+        .rate_limiter(AIORateLimiter(max_retries=3))
+        .concurrent_updates(True)
         .persistence(PicklePersistence(filepath=PERSISTENCE_FILE))
         .post_init(post_init)
         .post_shutdown(post_shutdown)
@@ -1157,7 +1235,17 @@ def build_application() -> Application:
     return application
 
 
+_conflict_seen = False
+
+# A restart often overlaps the previous process by a second or two. Rather than dying,
+# wait for the old poller to let go and take over.
+CONFLICT_RETRIES = 6
+CONFLICT_BACKOFF_SECONDS = 5
+
+
 def main() -> None:
+    global _conflict_seen
+
     try:
         db.ping()
     except DatabaseError:
@@ -1165,7 +1253,34 @@ def main() -> None:
         raise SystemExit(1)
 
     logger.info("Hackathon Match starting…")
-    build_application().run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+    for attempt in range(1, CONFLICT_RETRIES + 1):
+        _conflict_seen = False
+        try:
+            build_application().run_polling(
+                allowed_updates=Update.ALL_TYPES, drop_pending_updates=True
+            )
+        except Conflict:
+            _conflict_seen = True
+        except KeyboardInterrupt:
+            break
+
+        if not _conflict_seen:
+            break                       # clean shutdown
+
+        wait = CONFLICT_BACKOFF_SECONDS * attempt
+        logger.warning(
+            "Waiting %ss for the previous instance to stop (attempt %s/%s)…",
+            wait, attempt, CONFLICT_RETRIES,
+        )
+        time.sleep(wait)
+    else:
+        logger.error(
+            "Another process is still polling this bot token. Stop it, then start again."
+        )
+        raise SystemExit(1)
+
+    logger.info("Hackathon Match stopped.")
 
 
 if __name__ == "__main__":

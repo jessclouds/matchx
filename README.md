@@ -72,6 +72,8 @@ The database is already hosted (Supabase), so nothing else moves.
 ```bash
 python newevent.py "IDEATE 2026"     # prints a ready-to-share link
 python newevent.py --list            # every event, its link and participant count
+python newevent.py --close <code>    # finished hackathon: stops matching, keeps data
+python newevent.py --reopen <code>
 ```
 
 Handy for preparing links in advance, or handing an organiser a link without giving
@@ -155,6 +157,37 @@ without one is told how to create one and is kept out of matchmaking until they 
 | `keyboards.py` | Inline keyboards and card rendering |
 | `config.py` | Environment loading, deep links, logging setup |
 | `schema.sql` | Idempotent Postgres schema |
+
+## Operating at scale
+
+Designed for a pilot of many hackathons running at once, each with hundreds of
+participants.
+
+* **Browsing is one indexed query.** The four hard filters and the ranking keys are
+  applied in Postgres (`db.find_candidates`), which returns a single page of 25.
+  Nothing loads a whole event into Python, so cost per card is flat as the event
+  grows. `matching.rank_candidates` still does the authoritative ordering, and
+  `tests/test_scale.py` asserts the SQL and the Python rules agree exactly.
+* **Isolation is enforced in SQL**, not in the UI: every candidate, interest and match
+  query is keyed by `event_code`.
+* **Exactly one match per pair** is guaranteed by a unique constraint plus a
+  transaction-scoped advisory lock, verified by threaded simultaneous-accept tests.
+* **All durable state is in Postgres.** A restart loses nothing; only browsing
+  position lives in `user_data` (and even that is pickled).
+* **Connections** come from a checked pool (max 10) with a retry and short backoff for
+  the connections Supabase's pooler drops.
+* **Telegram limits** are handled by `AIORateLimiter`, which queues and retries so a
+  burst of match notifications cannot trip flood control. Updates are processed
+  concurrently.
+* **Abuse**: a bounded in-memory window caps a single user at 40 taps and 15 match
+  requests per minute.
+* **Finished hackathons** are closed rather than deleted — `python newevent.py --close
+  <code>` stops matching while keeping the data. Reopen with `--reopen`.
+
+Indexes: `profiles (event_code, is_active)`, GIN on `profiles.skills_offered` (for the
+offers ∩ needs overlap), `interests (event_code, from_user_id, status)`,
+`interests (event_code, to_user_id, status)`, unique `(event_code, from_user_id,
+to_user_id)`, and unique `(event_code, user_a, user_b)` on matches.
 
 ## Data model
 

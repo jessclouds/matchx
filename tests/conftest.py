@@ -51,3 +51,16 @@ def clean_database():
     purge_test_events()
     yield
     purge_test_events()
+
+
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    """The abuse guard is process-wide; each test starts with a clean window."""
+    try:
+        import main
+    except Exception:                     # BOT_TOKEN absent — those tests skip anyway
+        yield
+        return
+    main._recent_actions.clear()
+    yield
+    main._recent_actions.clear()

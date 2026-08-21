@@ -13,6 +13,11 @@ CREATE TABLE IF NOT EXISTS events (
 -- the announcement text they pasted.
 ALTER TABLE events ADD COLUMN IF NOT EXISTS organiser_telegram_id BIGINT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS announcement TEXT;
+-- Finished hackathons are closed rather than deleted: they stop matching but keep
+-- their history. See newevent.py --close.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;
+
+CREATE INDEX IF NOT EXISTS events_organiser_idx ON events (organiser_telegram_id);
 
 -- -------------------------------------------------------------- profiles ----
 CREATE TABLE IF NOT EXISTS profiles (
@@ -46,6 +51,11 @@ ALTER TABLE profiles ADD COLUMN IF NOT EXISTS updated_at  TIMESTAMPTZ NOT NULL D
 CREATE INDEX IF NOT EXISTS profiles_event_active_idx
     ON profiles (event_code, is_active);
 
+-- The hard filter "candidate.offers ∩ user.needs is non-empty" is an array overlap,
+-- so it needs a GIN index to stay fast once an event has thousands of profiles.
+CREATE INDEX IF NOT EXISTS profiles_offers_gin_idx
+    ON profiles USING GIN (skills_offered);
+
 -- ------------------------------------------------------------- interests ----
 -- One row per (requester -> recipient) pair, per event.
 --   pending  : requester asked, recipient has not answered yet
@@ -72,6 +82,10 @@ CREATE TABLE IF NOT EXISTS interests (
 
 CREATE INDEX IF NOT EXISTS interests_to_pending_idx
     ON interests (event_code, to_user_id, status);
+
+-- Browsing excludes everyone this user has already acted on.
+CREATE INDEX IF NOT EXISTS interests_from_idx
+    ON interests (event_code, from_user_id, status);
 
 -- --------------------------------------------------------------- matches ----
 -- Mutual acceptance only. user_a < user_b so a pair can exist at most once.

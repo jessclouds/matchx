@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import logging
+import time
 import random
 import re
 import string
@@ -21,6 +22,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from config import require_database_url
+from constants import ALL_SKILL_VALUES
 from matching import Profile
 
 logger = logging.getLogger(__name__)
@@ -49,7 +51,7 @@ try:
     _pool: "ConnectionPool | None" = ConnectionPool(
         DATABASE_URL,
         min_size=1,
-        max_size=5,
+        max_size=10,
         max_idle=120,
         max_lifetime=1800,
         timeout=15,
@@ -97,6 +99,8 @@ def _run(fn: Callable[[psycopg.Cursor], T]) -> T:
         except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
             last_error = exc
             logger.warning("Database connection problem (attempt %s/2): %s", attempt, exc)
+            if attempt == 1:
+                time.sleep(0.25)      # brief backoff before the single retry
             continue
         except psycopg.Error as exc:
             logger.exception("Database operation failed: %s", type(exc).__name__)
@@ -139,6 +143,33 @@ def get_event(event_code: str) -> str | None:
         cur.execute("SELECT name FROM events WHERE event_code = %s", (event_code,))
         row = cur.fetchone()
         return row["name"] if row else None
+
+    return _run(q)
+
+
+def get_event_row(event_code: str) -> dict[str, Any] | None:
+    if not event_code:
+        return None
+
+    def q(cur: psycopg.Cursor) -> dict[str, Any] | None:
+        cur.execute(
+            "SELECT event_code, name, is_active, organiser_telegram_id FROM events WHERE event_code = %s",
+            (event_code,),
+        )
+        return cur.fetchone()
+
+    return _run(q)
+
+
+def set_event_active(event_code: str, is_active: bool) -> bool:
+    """Close (or reopen) a hackathon. Closed events stop matching but keep their data."""
+
+    def q(cur: psycopg.Cursor) -> bool:
+        cur.execute(
+            "UPDATE events SET is_active = %s WHERE event_code = %s RETURNING event_code",
+            (is_active, event_code),
+        )
+        return cur.fetchone() is not None
 
     return _run(q)
 
@@ -332,8 +363,122 @@ def set_active(telegram_user_id: int, event_code: str, is_active: bool) -> None:
     _run(q)
 
 
+# The four hard filters from the spec, expressed in SQL so a browse never loads a
+# whole event into Python. Ranking itself stays in matching.py — this only pre-orders
+# by the same keys so the top page provably contains the best candidate.
+_CANDIDATE_SQL = f"""
+    SELECT {_P_COLUMNS}
+    FROM profiles p
+    JOIN events e ON e.event_code = p.event_code
+    WHERE p.event_code = %(event)s                    -- same hackathon
+      AND e.is_active
+      AND p.is_active                                 -- actively looking
+      AND p.telegram_user_id <> %(me)s                -- not the user themselves
+      AND p.telegram_username IS NOT NULL
+      AND cardinality(p.skills_offered) > 0
+      AND p.skills_offered && %(needs)s::text[]       -- offers ∩ needs is non-empty
+      AND NOT EXISTS (
+            SELECT 1 FROM interests i
+            WHERE i.event_code = p.event_code
+              AND i.from_user_id = %(me)s AND i.to_user_id = p.telegram_user_id)
+      AND NOT EXISTS (
+            SELECT 1 FROM interests i
+            WHERE i.event_code = p.event_code
+              AND i.from_user_id = p.telegram_user_id AND i.to_user_id = %(me)s
+              AND i.status IN ('pending', 'accepted', 'declined'))
+      AND NOT EXISTS (
+            SELECT 1 FROM matches m
+            WHERE m.event_code = p.event_code
+              AND m.user_a = LEAST(%(me)s, p.telegram_user_id)
+              AND m.user_b = GREATEST(%(me)s, p.telegram_user_id))
+    ORDER BY
+        CASE %(pref)s
+            WHEN 'same'      THEN (p.school =  %(school)s)::int
+            WHEN 'different' THEN (p.school <> %(school)s)::int
+            ELSE 0
+        END DESC,
+        (SELECT count(*) FROM unnest(p.skills_offered) s WHERE s = ANY(%(needs)s::text[])) DESC,
+        (SELECT count(*) FROM unnest(%(my_offers)s::text[]) s
+          WHERE s = ANY(CASE WHEN p.open_to_any OR cardinality(p.skills_needed) = 0
+                             THEN %(all_skills)s::text[] ELSE p.skills_needed END)) DESC,
+        random()
+    LIMIT %(limit)s
+"""
+
+
+def find_candidates(me: Profile, limit: int = 25) -> list[Profile]:
+    """Eligible candidates for `me`, best page first.
+
+    Returns at most `limit` rows; matching.rank_candidates then does the authoritative
+    ordering. Because the SQL orders by the same keys, the true best candidate is
+    always inside the page.
+    """
+    params = {
+        "event": me.event_code,
+        "me": me.telegram_user_id,
+        "needs": list(me.needs),
+        "my_offers": list(me.offers),
+        "all_skills": sorted(ALL_SKILL_VALUES),
+        "pref": (me.school_preference or "none").lower(),
+        "school": me.school,
+        "limit": limit,
+    }
+
+    def q(cur: psycopg.Cursor) -> list[Profile]:
+        cur.execute(_CANDIDATE_SQL, params)
+        return [_row_to_profile(row) for row in cur.fetchall()]
+
+    return _run(q)
+
+
+def count_active_others(event_code: str, telegram_user_id: int) -> int:
+    """How many other people are in this event at all — for the empty-state wording."""
+
+    def q(cur: psycopg.Cursor) -> int:
+        cur.execute(
+            """
+            SELECT count(*) AS n FROM profiles
+            WHERE event_code = %s AND is_active AND telegram_user_id <> %s
+            """,
+            (event_code, telegram_user_id),
+        )
+        return cur.fetchone()["n"]
+
+    return _run(q)
+
+
+def count_skipped(event_code: str, telegram_user_id: int) -> int:
+    def q(cur: psycopg.Cursor) -> int:
+        cur.execute(
+            """
+            SELECT count(*) AS n FROM interests
+            WHERE event_code = %s AND from_user_id = %s AND status = 'skipped'
+            """,
+            (event_code, telegram_user_id),
+        )
+        return cur.fetchone()["n"]
+
+    return _run(q)
+
+
+def count_interactions(event_code: str, telegram_user_id: int) -> int:
+    def q(cur: psycopg.Cursor) -> int:
+        cur.execute(
+            "SELECT count(*) AS n FROM interests WHERE event_code = %s AND from_user_id = %s",
+            (event_code, telegram_user_id),
+        )
+        return cur.fetchone()["n"]
+
+    return _run(q)
+
+
 def get_event_pool(event_code: str) -> list[Profile]:
-    """Every active profile in one event. Events are fully isolated from each other."""
+    """Every active profile in one event.
+
+    Reference implementation, used by the tests to check `find_candidates` against the
+    pure-Python rules. Do not call it on a hot path — browsing uses `find_candidates`,
+    which filters and pages in SQL instead of loading the whole event.
+    """
 
     def q(cur: psycopg.Cursor) -> list[Profile]:
         cur.execute(
@@ -582,6 +727,26 @@ def get_matches(telegram_user_id: int, event_code: str) -> list[Profile]:
             (event_code, telegram_user_id, event_code, telegram_user_id),
         )
         return [_row_to_profile(row) for row in cur.fetchall()]
+
+    return _run(q)
+
+
+def menu_counts(telegram_user_id: int, event_code: str) -> tuple[int, int]:
+    """(matches, pending incoming requests) in a single round trip, for the menu badge."""
+
+    def q(cur: psycopg.Cursor) -> tuple[int, int]:
+        cur.execute(
+            """
+            SELECT
+              (SELECT count(*) FROM matches
+                WHERE event_code = %(event)s AND %(me)s IN (user_a, user_b)) AS matches,
+              (SELECT count(*) FROM interests
+                WHERE event_code = %(event)s AND to_user_id = %(me)s AND status = 'pending') AS pending
+            """,
+            {"event": event_code, "me": telegram_user_id},
+        )
+        row = cur.fetchone()
+        return row["matches"], row["pending"]
 
     return _run(q)
 

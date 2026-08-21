@@ -23,13 +23,25 @@ def main() -> int:
     parser.add_argument("--announcement", help="Path to a file with the announcement text")
     parser.add_argument("--organiser", type=int, help="Organiser's Telegram user id (optional)")
     parser.add_argument("--list", action="store_true", help="List existing events and their links")
+    parser.add_argument("--close", metavar="EVENT_CODE",
+                        help="Close a finished hackathon: it stops matching but keeps its data")
+    parser.add_argument("--reopen", metavar="EVENT_CODE", help="Reopen a closed hackathon")
     args = parser.parse_args()
+
+    if args.close or args.reopen:
+        code = args.close or args.reopen
+        active = bool(args.reopen)
+        if not db.set_event_active(code, active):
+            print(f"No event with code {code!r}.")
+            return 1
+        print(f"{code} is now {'open' if active else 'closed'}.")
+        return 0
 
     if args.list:
         with db.get_connection() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT e.event_code, e.name,
+                SELECT e.event_code, e.name, e.is_active,
                        (SELECT count(*) FROM profiles p WHERE p.event_code = e.event_code) AS participants
                 FROM events e ORDER BY e.created_at
                 """
@@ -39,7 +51,8 @@ def main() -> int:
             print("No events yet. Create one:  python newevent.py \"My Hackathon\"")
             return 0
         for row in rows:
-            print(f"\n{row['name']}  ({row['participants']} joined)")
+            state = "" if row["is_active"] else "  [closed]"
+            print(f"\n{row['name']}  ({row['participants']} joined){state}")
             print(f"  {deep_link(row['event_code'])}")
         print()
         return 0

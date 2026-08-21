@@ -203,15 +203,21 @@ REVISIT_NOTES = {
 }
 
 
-def render_candidate(candidate: ScoredCandidate, remaining: int | None = None, note: str = "") -> str:
+def render_candidate(
+    candidate: ScoredCandidate,
+    remaining: int | None = None,
+    note: str = "",
+    capped: bool = False,
+) -> str:
     """A candidate card. No name, no @username — those appear only after a mutual yes.
 
-    `remaining` is the size of the live queue; None marks a card reached with Back.
+    `remaining` is how many more are queued (None marks a card reached with Back).
+    `capped` means the queue was cut off at a page boundary, so there may be more.
     """
     if remaining is None:
         tail = " · seen earlier"
     elif remaining > 0:
-        tail = f" · {remaining} more in your queue"
+        tail = f" · {remaining}{'+' if capped else ''} more in your queue"
     else:
         tail = " · last one for now"
 
