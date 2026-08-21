@@ -38,14 +38,14 @@ STATUSES: Final[list[tuple[str, str]]] = [
 ]
 
 SKILLS: Final[list[tuple[str, str]]] = [
-    ("software", "Software / App Dev"),
+    ("software", "Software Dev"),
     ("ai_data", "AI / Data"),
-    ("healthcare", "Healthcare / Clinical"),
+    ("healthcare", "Healthcare"),
     ("user_research", "User Research"),
     ("uiux", "UI / UX Design"),
-    ("hardware", "Hardware / Engineering"),
-    ("business", "Business / Pitching"),
-    ("marketing", "Marketing / Ops"),
+    ("hardware", "Hardware"),
+    ("business", "Business Pitching"),
+    ("marketing", "Marketing"),
     ("legal", "Legal / Regulatory"),
 ]
 
@@ -99,7 +99,7 @@ def skill_label(value: str) -> str:
 
 
 def format_skills(values, empty_text: str = "—") -> str:
-    """Turn ['software', 'ai_data'] into 'Software / App Dev, AI / Data' (stable order)."""
+    """Turn ['software', 'ai_data'] into 'Software Dev, AI / Data' (stable order)."""
     chosen = set(values or ())
     if not chosen:
         return empty_text
