@@ -196,6 +196,7 @@ def test_abandoned_onboarding_then_return(world, event):
     onboard_rest.tap("SMU"); onboard_rest.tap("No preference"); onboard_rest.tap("Computing")
     onboard_rest.tap("Solo"); onboard_rest.tap("Software"); onboard_rest.tap("Done")
     onboard_rest.tap("UI / UX"); onboard_rest.tap("Done")
+    onboard_rest.tap("Skip")                       # optional note
     assert db.get_profile(ALICE, event).school == "SMU"
 
 
@@ -690,6 +691,7 @@ def test_participant_never_types_an_event_code(world, event):
     for tap in onboard_taps:
         alice.tap(tap)
     alice.tap("Software"); alice.tap("Done"); alice.tap("UI / UX"); alice.tap("Done")
+    alice.tap("Skip")                              # optional note
     assert db.get_profile(ALICE, event).event_code == event
 
 
