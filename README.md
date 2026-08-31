@@ -58,31 +58,34 @@ just a process that stays alive. While it is stopped, event links do nothing.
 
 Any always-on host works; the repo ships a `Dockerfile` and a `Procfile`.
 
-**Koyeb (Worker service):**
-1. Push this repo to GitHub and create a **Worker** service from it (not Web —
-   long polling opens no port and needs no health check)
-2. Builder: **Dockerfile** (the repo has one), or Buildpack with
-   build `pip install -r requirements.txt` and run `python main.py`
-3. Set the environment variables below as **secrets** in the Koyeb dashboard
-4. Instance size: 512 MB is ample — measured ~44 MB in the container
-5. Scaling: keep **exactly one instance**. Two pollers on one bot token conflict;
-   the newer one waits and takes over, but you lose updates while they overlap.
+**Railway (Hobby plan):**
+1. Push this repo to GitHub, then Railway → **New Project → Deploy from GitHub repo**
+2. `railway.json` pins the build for you: Nixpacks (not the Dockerfile),
+   `python main.py` as the start command, and **1 replica**
+3. Add the environment variables below under **Variables** (Railway keeps them secret)
+4. Settings → **turn App Sleeping OFF**. A polling bot receives no inbound HTTP, so a
+   sleeping service would never wake up
+5. No public domain, no port, no health check — it is a worker, not a web service.
+   Railway may note that no port was detected; that is expected
+6. Pick a region near your Supabase project to keep query latency down
 
 Required: `BOT_TOKEN`, `BOT_USERNAME`, `DATABASE_URL`.
 Optional: `LOG_LEVEL` (default INFO), `ORGANISER_IDS`, `PERSISTENCE_FILE`
-(default `bot_state.pickle`; set `/tmp/bot_state.pickle` on an ephemeral filesystem).
+(default `bot_state.pickle` next to the code; `/tmp/bot_state.pickle` also works).
 
-**Railway / Render / Fly.io:** same idea — the `Procfile` runs `python main.py` as a
-worker; set the same environment variables in the host's dashboard, never commit `.env`.
+Build and start, if you ever need to set them by hand:
 
-The database is already hosted (Supabase), so nothing else moves. Nothing durable is
-written to local disk: profiles, interests, matches and events all live in Postgres.
-The only local file is the persistence pickle, which holds in-progress onboarding and
-browsing position — losing it on a redeploy costs a user at most their current
-questionnaire, never a profile, request or match.
+```
+build:  pip install -r requirements.txt
+start:  python main.py
+```
 
-SIGTERM (what Koyeb sends on stop and redeploy) shuts the bot down cleanly and exits 0;
-measured at ~2 seconds.
+Verified locally against a clean `python:3.13-slim` container using exactly the files
+git would serve: `pip install -r requirements.txt` then `python main.py` reaches
+"Application started" in ~9s and uses ~48 MB.
+
+**Other hosts** (Render, Fly.io, Koyeb): the `Procfile` runs `python main.py` as a
+worker, or use the `Dockerfile`. Same environment variables either way.
 
 **Creating events without Telegram**
 
