@@ -107,7 +107,11 @@ different links never see each other.
 1. Open the organiser's link — the bot confirms *"You're joining the teammate-matching
    pool for &lt;hackathon name&gt;"* so they can check they're in the right pool.
    Participants never type or pick an event code; the link carries it.
-2. Six questions: school → school preference → discipline → team status → skills offered → skills needed
+2. Six questions: school → school preference → discipline → team status → skills offered
+   → skills needed, then an optional one-line note (up to 160 characters) — e.g. the
+   track they want, what they're building, or the teammate they're after. The note is
+   display only: it never affects eligibility or ranking, and it can be added, replaced
+   or removed later from the profile screen.
 3. Browse candidates one at a time: **← Back**, **Request Match**, **Next →**
    (Back re-shows the previous card — it never undoes a request or a match, and you
    can request someone you had already passed on)
@@ -134,7 +138,7 @@ single field, pause/resume matchmaking), `/events` (switch hackathon), `/restart
 3. `len(user.offers ∩ candidate.needs)`
 4. exact ties are shuffled, so nobody is permanently first
 
-**Deliberately not used:** discipline is display-only and never affects eligibility or
+**Deliberately not used:** discipline and the profile note are display-only and never affects eligibility or
 ranking; team status only signals that someone is looking and is never scored; there is
 no ML, no embedding, no opaque score.
 

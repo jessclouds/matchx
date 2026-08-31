@@ -35,6 +35,7 @@ DATABASE_URL = require_database_url()
 _COLUMN_NAMES = (
     "telegram_user_id", "event_code", "telegram_username", "school", "school_preference",
     "discipline", "team_status", "skills_offered", "skills_needed", "open_to_any", "is_active",
+    "note",
 )
 _PROFILE_COLUMNS = ", ".join(_COLUMN_NAMES)
 # Qualified variant for queries that join another table carrying event_code.
@@ -128,6 +129,7 @@ def _row_to_profile(row: dict[str, Any]) -> Profile:
         skills_needed=tuple(row["skills_needed"] or ()),
         open_to_any=bool(row["open_to_any"]),
         is_active=bool(row["is_active"]),
+        note=row.get("note"),
     )
 
 
@@ -247,6 +249,7 @@ def save_profile(
     skills_offered: Sequence[str],
     skills_needed: Sequence[str],
     open_to_any: bool,
+    note: str | None = None,
 ) -> None:
     """Insert a profile, or overwrite it if one already exists for this user + event.
 
@@ -260,9 +263,9 @@ def save_profile(
             INSERT INTO profiles (
                 telegram_user_id, event_code, telegram_username,
                 school, school_preference, discipline, team_status,
-                skills_offered, skills_needed, open_to_any, is_active, updated_at
+                skills_offered, skills_needed, open_to_any, note, is_active, updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true, now())
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true, now())
             ON CONFLICT (telegram_user_id, event_code) DO UPDATE SET
                 telegram_username = EXCLUDED.telegram_username,
                 school            = EXCLUDED.school,
@@ -272,6 +275,7 @@ def save_profile(
                 skills_offered    = EXCLUDED.skills_offered,
                 skills_needed     = EXCLUDED.skills_needed,
                 open_to_any       = EXCLUDED.open_to_any,
+                note              = EXCLUDED.note,
                 is_active         = true,
                 updated_at        = now()
             """,
@@ -286,10 +290,22 @@ def save_profile(
                 list(skills_offered),
                 list(skills_needed),
                 bool(open_to_any),
+                normalise_note(note),
             ),
         )
 
     _run(q)
+
+
+NOTE_MAX_LENGTH = 160
+
+
+def normalise_note(note: str | None) -> str | None:
+    """Trim a profile note; blank becomes NULL. Length is validated before this."""
+    if note is None:
+        return None
+    cleaned = " ".join(note.split())
+    return cleaned[:NOTE_MAX_LENGTH] or None
 
 
 def get_profile(telegram_user_id: int, event_code: str) -> Profile | None:

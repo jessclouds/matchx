@@ -5,7 +5,6 @@ the Python rules in matching.py would return, and that it stays fast on a large 
 Everything is created inside a throwaway event and deleted afterwards.
 """
 
-import os
 import random
 import sys
 import time
@@ -16,7 +15,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-pytestmark = pytest.mark.skipif(not os.getenv("DATABASE_URL"), reason="DATABASE_URL not configured")
+from conftest import requires_db  # noqa: E402
+
+pytestmark = requires_db
 
 import db  # noqa: E402
 from constants import SKILLS  # noqa: E402

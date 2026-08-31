@@ -4,7 +4,6 @@ Each test runs inside a throwaway event that is deleted afterwards, so it never
 touches real hackathon data. Skipped automatically when DATABASE_URL is absent.
 """
 
-import os
 import sys
 import uuid
 from pathlib import Path
@@ -13,7 +12,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-pytestmark = pytest.mark.skipif(not os.getenv("DATABASE_URL"), reason="DATABASE_URL not configured")
+from conftest import requires_db  # noqa: E402
+
+pytestmark = requires_db
 
 import db  # noqa: E402
 from matching import rank_candidates  # noqa: E402
@@ -296,3 +297,65 @@ def test_username_refresh_updates_every_event(event, other_event):
     assert db.get_profile(ALICE, other_event).telegram_username == "renamed"
     db.update_username(ALICE, None)
     assert db.get_profile(ALICE, event).telegram_username is None
+
+
+# ------------------------------------------------------------- profile note
+
+def test_note_round_trips(event):
+    note = "Interested in healthcare tracks. Want to ship something pilotable."
+    db.save_profile(ALICE, event, "alice", "NUS", "none", "comp", "looking",
+                    ["software"], ["uiux"], False, note)
+    assert db.get_profile(ALICE, event).note == note
+
+
+def test_note_defaults_to_null(event):
+    seed(event, ALICE)
+    assert db.get_profile(ALICE, event).note is None
+
+
+def test_note_is_updated_by_upsert(event):
+    db.save_profile(ALICE, event, "alice", "NUS", "none", "comp", "looking",
+                    ["software"], ["uiux"], False, "first note")
+    db.save_profile(ALICE, event, "alice", "NUS", "none", "comp", "looking",
+                    ["software"], ["uiux"], False, "second note")
+    assert db.get_profile(ALICE, event).note == "second note"
+
+    db.save_profile(ALICE, event, "alice", "NUS", "none", "comp", "looking",
+                    ["software"], ["uiux"], False, None)
+    assert db.get_profile(ALICE, event).note is None
+
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM profiles WHERE event_code = %s", (event,))
+        assert cur.fetchone()["n"] == 1
+
+
+def test_blank_note_is_stored_as_null(event):
+    db.save_profile(ALICE, event, "alice", "NUS", "none", "comp", "looking",
+                    ["software"], ["uiux"], False, "   ")
+    assert db.get_profile(ALICE, event).note is None
+
+
+def test_note_whitespace_is_collapsed(event):
+    db.save_profile(ALICE, event, "alice", "NUS", "none", "comp", "looking",
+                    ["software"], ["uiux"], False, "  lots   of\n\nspace  ")
+    assert db.get_profile(ALICE, event).note == "lots of space"
+
+
+def test_database_rejects_an_over_long_note(event):
+    """The app validates at 160; the column constraint is the backstop."""
+    seed(event, ALICE)
+    with db.get_connection() as conn, conn.cursor() as cur:
+        with pytest.raises(Exception):
+            cur.execute("UPDATE profiles SET note = %s WHERE telegram_user_id = %s AND event_code = %s",
+                        ("x" * 161, ALICE, event))
+            conn.commit()
+        conn.rollback()
+
+
+def test_note_does_not_affect_candidate_selection(event):
+    seed(event, ALICE, offers=("software",), needs=("uiux",))
+    db.save_profile(BOB, event, "bob", "NUS", "none", "comp", "looking",
+                    ["uiux"], ["software"], False, "a note that mentions legal and hardware")
+    me = db.get_profile(ALICE, event)
+    ids = [p.telegram_user_id for p in db.find_candidates(me)]
+    assert ids == [BOB]

@@ -17,6 +17,29 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 load_dotenv(ROOT / ".env")
 
+def _database_available() -> bool:
+    """True when the configured database actually answers.
+
+    A paused or deleted Supabase project must skip the database-backed tests with a
+    clear reason, not error out of every test in the suite.
+    """
+    if not os.getenv("DATABASE_URL"):
+        return False
+    try:
+        import db
+
+        return db.ping()
+    except Exception:
+        return False
+
+
+DATABASE_AVAILABLE = _database_available()
+
+requires_db = pytest.mark.skipif(
+    not DATABASE_AVAILABLE,
+    reason="database unreachable (Supabase project paused/deleted?) — see README",
+)
+
 TEST_ORGANISER_MIN = 900_000_000
 TEST_ORGANISER_MAX = 919_999_999
 TEST_EVENT_NAME_PREFIXES = ("pytest %", "E2E %", "Quantum Hack 2026", "Same Name Hack")
@@ -24,7 +47,7 @@ TEST_EVENT_NAME_PREFIXES = ("pytest %", "E2E %", "Quantum Hack 2026", "Same Name
 
 def purge_test_events() -> None:
     """Delete every event a test created, plus everything hanging off it."""
-    if not os.getenv("DATABASE_URL"):
+    if not DATABASE_AVAILABLE:
         return
     import db
 

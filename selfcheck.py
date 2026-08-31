@@ -102,6 +102,7 @@ def main_check() -> int:
         ada.tap("NUS"); ada.tap("No preference"); ada.tap("Computing"); ada.tap("Solo")
         ada.tap("Software"); ada.tap("Done")
         ada.tap("UI / UX"); ada.tap("Done")
+        ada.tap("Add note"); ada.say("Health-tech track. Want to ship something pilotable.")
         show("Ada", ada)
         ada_profile = db.get_profile(ADA, event_code)
         check("Ada's profile saved to Postgres", ada_profile is not None)
@@ -121,6 +122,7 @@ def main_check() -> int:
         ben.tap("NUS"); ben.tap("No preference"); ben.tap("Design"); ben.tap("Solo")
         ben.tap("UI / UX"); ben.tap("Done")
         ben.tap("Software"); ben.tap("Done")
+        ben.tap("Skip")                      # the note is optional
         ben.clear()
         check("Ben's profile saved", db.get_profile(BEN, event_code) is not None)
 
@@ -135,8 +137,11 @@ def main_check() -> int:
         step("6. Ada taps 'Request match' — Ben gets her card")
         ada.command("find")
         ada.tap("Request match")
+        ben_inbox_text = ben.all_text()
         show("Ada", ada)
         show("Ben", ben)
+        check("Ada's profile note reached Ben's card",
+              "Health-tech track" in ben_inbox_text)
         check("one-sided interest creates NO match", db.get_matches(ADA, event_code) == [])
         check("Ben was sent the request", [p.telegram_user_id for p in db.get_incoming_requests(BEN, event_code)] == [ADA])
 

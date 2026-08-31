@@ -10,9 +10,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from conftest import DATABASE_AVAILABLE  # noqa: E402
+
 pytestmark = pytest.mark.skipif(
-    not (os.getenv("DATABASE_URL") and os.getenv("BOT_TOKEN")),
-    reason="DATABASE_URL and BOT_TOKEN required",
+    not (DATABASE_AVAILABLE and os.getenv("BOT_TOKEN")),
+    reason="needs a reachable database and BOT_TOKEN",
 )
 
 import db  # noqa: E402
@@ -65,7 +67,8 @@ def _shown_candidate_id(world: World, event_code: str) -> int:
 
 
 def onboard(session: Session, event_code: str, *, school="NUS", pref="No preference",
-            discipline="Computing", status="Solo", offers=("Software",), needs=("UI / UX",)):
+            discipline="Computing", status="Solo", offers=("Software",), needs=("UI / UX",),
+            note=None):
     """Walk one user through the whole questionnaire by tapping real buttons."""
     session.command("start", event_code)
     session.tap(school)
@@ -81,6 +84,12 @@ def onboard(session: Session, event_code: str, *, school="NUS", pref="No prefere
         for skill in needs:
             session.tap(skill)
         session.tap("Done")
+    # Final, optional step: the profile note.
+    if note is None:
+        session.tap("Skip")
+    else:
+        session.tap("Add note")
+        session.say(note)
 
 
 # ------------------------------------------------------------------- entry
@@ -1005,3 +1014,169 @@ def test_browsing_position_resets_harmlessly_after_restart(world, application, e
     assert not alice2.has_button("Back"), "history is navigation state; it may reset"
     # The durable part — who was skipped — is unaffected.
     assert db.get_skipped_user_ids(ALICE, event)
+
+
+# ------------------------------------------------------------- profile note
+
+NOTE = "Interested in mental health / healthcare tracks. Hoping to build something we can actually pilot."
+
+
+def test_note_step_is_offered_after_skills(world, event):
+    alice = Session(world, ALICE, "alice")
+    alice.command("start", event)
+    alice.tap("NUS"); alice.tap("No preference"); alice.tap("Computing"); alice.tap("Solo")
+    alice.tap("Software"); alice.tap("Done")
+    alice.tap("UI / UX"); alice.tap("Done")
+
+    assert "short note" in alice.last.text
+    assert alice.has_button("Add note") and alice.has_button("Skip")
+    assert db.get_profile(ALICE, event) is None, "nothing is saved until the note step is answered"
+
+
+def test_add_note_saves_it_on_the_profile(world, event):
+    alice = Session(world, ALICE, "alice")
+    onboard(alice, event, note=NOTE)
+
+    profile = db.get_profile(ALICE, event)
+    assert profile is not None
+    assert profile.note == NOTE
+    assert "Profile saved" in alice.all_text()
+    assert NOTE in alice.all_text(), "the note appears on the user's own profile"
+
+
+def test_skip_leaves_the_profile_without_a_note(world, event):
+    alice = Session(world, ALICE, "alice")
+    onboard(alice, event)                       # default: taps Skip
+    profile = db.get_profile(ALICE, event)
+    assert profile is not None
+    assert profile.note is None
+    assert "Profile saved" in alice.all_text()
+
+
+def test_note_longer_than_160_characters_is_rejected_then_accepted(world, event):
+    alice = Session(world, ALICE, "alice")
+    alice.command("start", event)
+    alice.tap("NUS"); alice.tap("No preference"); alice.tap("Computing"); alice.tap("Solo")
+    alice.tap("Software"); alice.tap("Done")
+    alice.tap("UI / UX"); alice.tap("Done")
+    alice.tap("Add note")
+
+    too_long = "x" * 161
+    alice.say(too_long)
+    assert "161 characters" in alice.last.text and "160" in alice.last.text
+    assert db.get_profile(ALICE, event) is None, "an over-long note must not save the profile"
+    assert alice.has_button("Skip"), "the user can still back out"
+
+    alice.say("y" * 160)                        # exactly at the limit
+    profile = db.get_profile(ALICE, event)
+    assert profile is not None and profile.note == "y" * 160
+
+
+def test_note_appears_at_the_bottom_of_a_candidate_card(world, event):
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",), note=NOTE)
+
+    alice.clear()
+    alice.command("find")
+    card = alice.last.text
+    assert NOTE in card
+    assert card.rstrip().endswith(NOTE), "the note sits at the bottom of the card"
+    assert card.index("Offers:") < card.index(NOTE)
+    assert "bob" not in card.lower(), "the note must not leak identity handling"
+
+
+def test_card_without_a_note_is_unchanged(world, event):
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",))
+
+    alice.clear()
+    alice.command("find")
+    card = alice.last.text
+    assert card.rstrip().endswith("Software Dev") or "Matches your needs" in card
+    assert not card.rstrip().endswith("\n")
+
+
+def test_note_shows_on_an_incoming_request_card(world, event):
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",), note=NOTE)
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",))
+
+    alice.command("find")
+    alice.tap("Request Match")
+    assert "wants to team up" in bob.all_text()
+    assert NOTE in bob.all_text()
+
+
+def test_note_can_be_added_edited_and_removed_later(world, event):
+    alice = Session(world, ALICE, "alice")
+    onboard(alice, event)                       # starts with no note
+    assert db.get_profile(ALICE, event).note is None
+
+    alice.command("profile")
+    alice.tap("Edit profile")
+    alice.tap("Note")
+    alice.tap("Add note")
+    alice.say(NOTE)
+    assert db.get_profile(ALICE, event).note == NOTE
+
+    alice.command("profile")                    # replace it
+    alice.tap("Edit profile")
+    alice.tap("Note")
+    assert NOTE in alice.last.text, "the current note is shown before replacing it"
+    alice.tap("Replace note")
+    alice.say("Now looking for a hardware person.")
+    assert db.get_profile(ALICE, event).note == "Now looking for a hardware person."
+
+    alice.command("profile")                    # remove it
+    alice.tap("Edit profile")
+    alice.tap("Note")
+    alice.tap("Remove note")
+    assert db.get_profile(ALICE, event).note is None
+
+
+def test_keeping_a_note_does_not_wipe_it(world, event):
+    alice = Session(world, ALICE, "alice")
+    onboard(alice, event, note=NOTE)
+    alice.command("profile")
+    alice.tap("Edit profile")
+    alice.tap("Note")
+    alice.tap("Keep it")
+    assert db.get_profile(ALICE, event).note == NOTE
+
+
+def test_editing_other_fields_preserves_the_note(world, event):
+    alice = Session(world, ALICE, "alice")
+    onboard(alice, event, school="NUS", note=NOTE)
+    alice.command("profile")
+    alice.tap("Edit profile")
+    alice.tap("School")
+    alice.tap("SUTD")
+    profile = db.get_profile(ALICE, event)
+    assert profile.school == "SUTD"
+    assert profile.note == NOTE, "an unrelated edit must not drop the note"
+
+
+def test_redoing_onboarding_can_clear_the_note(world, event):
+    alice = Session(world, ALICE, "alice")
+    onboard(alice, event, note=NOTE)
+    alice.command("restart")
+    alice.tap("NUS"); alice.tap("No preference"); alice.tap("Computing"); alice.tap("Solo")
+    alice.tap("Software"); alice.tap("Done")
+    alice.tap("UI / UX"); alice.tap("Done")
+    alice.tap("Skip")
+    assert db.get_profile(ALICE, event).note is None
+
+
+def test_note_survives_a_restart(world, application, event):
+    alice = Session(world, ALICE, "alice")
+    onboard(alice, event, note=NOTE)
+
+    restarted = World(application)
+    alice2 = Session(restarted, ALICE, "alice")
+    alice2.command("profile")
+    assert NOTE in alice2.last.text

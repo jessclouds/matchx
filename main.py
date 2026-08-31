@@ -14,7 +14,7 @@ from typing import Any, Awaitable, Callable
 
 from telegram import BotCommand, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Conflict, Forbidden, TelegramError
+from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, TelegramError
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -33,6 +33,10 @@ from constants import (
     DISCIPLINES,
     HELP_TEXT,
     MAX_SKILLS,
+    NOTE_ASK_TEXT,
+    NOTE_EXISTING_PROMPT,
+    NOTE_MAX_LENGTH,
+    NOTE_PROMPT,
     NEED_QUESTION,
     NO_USERNAME_MESSAGE,
     OFFER_QUESTION,
@@ -53,7 +57,7 @@ DB_ERROR_TEXT = "I couldn't reach the database just now. Please try again in a m
 
 # Onboarding order. Each answer either chains to the next step or, when the user is
 # editing a single field, saves and returns to the profile screen.
-STEPS = ["school", "pref", "discipline", "status", "offer", "need"]
+STEPS = ["school", "pref", "discipline", "status", "offer", "need", "note"]
 
 
 # --------------------------------------------------------------------- helpers
@@ -310,6 +314,7 @@ async def ask_step(update: Update, context: ContextTypes.DEFAULT_TYPE, step: str
         "status": ask_team_status,
         "offer": ask_skills_offered,
         "need": ask_skills_needed,
+        "note": ask_note,
     }[step]
     await asker(update, context)
 
@@ -458,6 +463,72 @@ async def handle_skill_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
     await safe_edit(query, reply_markup=kb.build_skill_keyboard(prefix, selected, show_wildcard=(prefix == "need")))
 
 
+# ------------------------------------------------------------------ note step
+
+# Optional one-line note shown on the participant's card. It is never used for
+# eligibility or ranking — it exists so people can say what they want to build.
+
+
+async def ask_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    existing = draft(context).get("note")
+    if existing:
+        await send(
+            update,
+            NOTE_EXISTING_PROMPT.format(note=kb.esc(existing)),
+            reply_markup=kb.note_keyboard(has_note=True),
+        )
+        return
+    await send(update, NOTE_PROMPT, reply_markup=kb.note_keyboard())
+
+
+async def handle_note_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+
+    if choice == "add":
+        context.user_data["mode"] = "await_note"
+        await safe_edit(query, NOTE_ASK_TEXT, reply_markup=kb.note_input_keyboard())
+        return
+
+    context.user_data.pop("mode", None)
+
+    if choice == "remove":
+        draft(context)["note"] = None
+        await safe_edit(query, "Note removed.")
+        await advance(update, context, "note")
+        return
+
+    # Skip: leave any existing note exactly as it was.
+    draft(context).setdefault("note", None)
+    await safe_edit(query, "Note unchanged." if draft(context).get("note") else "No note added.")
+    await advance(update, context, "note")
+
+
+@db_guard
+async def capture_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """One free-text message, validated against the character limit."""
+    text = " ".join((update.message.text or "").split())
+
+    if not text:
+        await send(update, NOTE_ASK_TEXT, reply_markup=kb.note_input_keyboard())
+        return
+
+    if len(text) > NOTE_MAX_LENGTH:
+        await send(
+            update,
+            f"That's {len(text)} characters — the limit is {NOTE_MAX_LENGTH}. "
+            "Please send a shorter version.",
+            reply_markup=kb.note_input_keyboard(),
+        )
+        return
+
+    context.user_data.pop("mode", None)
+    draft(context)["note"] = text
+    await send(update, "Note saved.")
+    await advance(update, context, "note")
+
+
 @db_guard
 async def save_and_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Persist the draft (upsert on telegram_user_id + event_code) and show the profile."""
@@ -500,6 +571,7 @@ async def save_and_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         offered,
         needed,
         open_to_any,
+        data.get("note"),
     )
     logger.info("Saved profile for user %s at event %s", user.id, event_code)
 
@@ -989,6 +1061,7 @@ async def handle_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "offer_skills": set(profile.skills_offered),
         "need_skills": set(profile.skills_needed),
         "open_to_any": profile.open_to_any,
+        "note": profile.note,
     }
     context.user_data["edit_field"] = field
     await ask_step(update, context, field)
@@ -1131,6 +1204,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if mode == "await_announcement":
         await create_event_from_announcement(update, context)
         return
+    if mode == "await_note":
+        await capture_note(update, context)
+        return
 
     draft_event = context.user_data.get("draft", {}).get("event_code")
     mid_onboarding = bool(draft_event) and not await run_db(
@@ -1155,6 +1231,12 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
         global _conflict_seen
         _conflict_seen = True
         logger.warning("Another instance is polling this bot token.")
+        return
+
+    if isinstance(context.error, NetworkError):
+        # Transient connectivity (Wi-Fi drop, DNS blip). python-telegram-bot retries
+        # polling by itself, so a one-line warning beats a traceback per attempt.
+        logger.warning("Network problem talking to Telegram: %s", context.error)
         return
 
     logger.exception("Unhandled error while processing update", exc_info=context.error)
@@ -1224,6 +1306,7 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(handle_discipline_choice, pattern=r"^discipline_"))
     application.add_handler(CallbackQueryHandler(handle_team_status_choice, pattern=r"^status_"))
     application.add_handler(CallbackQueryHandler(handle_skill_choice, pattern=r"^(offer|need)_"))
+    application.add_handler(CallbackQueryHandler(handle_note_choice, pattern=r"^note:"))
     application.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^menu:"))
     application.add_handler(CallbackQueryHandler(handle_edit_field, pattern=r"^edit:"))
     application.add_handler(CallbackQueryHandler(handle_browse_action, pattern=r"^browse:"))

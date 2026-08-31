@@ -14,12 +14,12 @@ from matching import Profile, is_eligible, rank_candidates, school_fit
 
 def make(uid, *, event="hack1", school="NUS", pref="none", discipline="comp",
          status="looking", offers=("software",), needs=("uiux",),
-         open_to_any=False, active=True, username="user"):
+         open_to_any=False, active=True, username="user", note=None):
     return Profile(
         telegram_user_id=uid, event_code=event, telegram_username=username,
         school=school, school_preference=pref, discipline=discipline,
         team_status=status, skills_offered=tuple(offers), skills_needed=tuple(needs),
-        open_to_any=open_to_any, is_active=active,
+        open_to_any=open_to_any, is_active=active, note=note,
     )
 
 
@@ -181,3 +181,45 @@ def test_profile_card_escapes_injected_markup():
     assert "<script>" not in rendered
     assert "&lt;script&gt;" in rendered
     assert "Jess's Hack" in rendered
+
+
+# ------------------------------------------------- the note is display only
+
+def test_note_does_not_affect_eligibility():
+    me = make(1, needs=("uiux",))
+    assert is_eligible(me, make(2, offers=("uiux",), note=None))
+    assert is_eligible(me, make(3, offers=("uiux",), note="building a triage app"))
+    assert not is_eligible(me, make(4, offers=("legal",), note="uiux uiux uiux"))
+
+
+def test_note_does_not_affect_ranking():
+    me = make(1, pref="none", needs=("uiux",))
+    plain = make(2, offers=("uiux",), needs=("software",))
+    chatty = make(3, offers=("uiux",), needs=("software",), note="a" * 160)
+    ranked = rank_candidates(me, [plain, chatty], rng=random.Random(0))
+    assert {c.sort_key for c in ranked} == {(0, 1, 1)}
+
+
+def test_note_defaults_to_none():
+    assert make(1).note is None
+
+
+def test_note_is_escaped_on_cards():
+    import keyboards as kb
+    from matching import score
+
+    me = make(1, needs=("uiux",))
+    other = make(2, offers=("uiux",), note="<b>hi</b> & bye")
+    card = kb.render_candidate(score(me, other), remaining=0)
+    assert "<b>hi</b>" not in card.replace("<b>UI / UX Design</b>", "")
+    assert "&lt;b&gt;hi&lt;/b&gt; &amp; bye" in card
+
+
+def test_card_without_a_note_has_no_empty_block():
+    import keyboards as kb
+    from matching import score
+
+    me = make(1, needs=("uiux",))
+    card = kb.render_candidate(score(me, make(2, offers=("uiux",))), remaining=0)
+    assert not card.rstrip().endswith("\n")
+    assert card.count("\n\n") == card.strip().count("\n\n")

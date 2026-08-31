@@ -111,9 +111,28 @@ def edit_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("Team status", callback_data="edit:status")],
         [InlineKeyboardButton("Skills I offer", callback_data="edit:offer"),
          InlineKeyboardButton("Skills I need", callback_data="edit:need")],
+        [InlineKeyboardButton("Note", callback_data="edit:note")],
         [InlineKeyboardButton("Redo everything", callback_data="menu:restart")],
         [InlineKeyboardButton("Back", callback_data="menu:profile")],
     ])
+
+
+def note_keyboard(has_note: bool = False) -> InlineKeyboardMarkup:
+    """Add/Skip while onboarding; Replace/Remove once a note exists."""
+    if has_note:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("Replace note", callback_data="note:add"),
+            InlineKeyboardButton("Remove note", callback_data="note:remove"),
+        ], [InlineKeyboardButton("Keep it", callback_data="note:skip")]])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Add note", callback_data="note:add"),
+        InlineKeyboardButton("Skip", callback_data="note:skip"),
+    ]])
+
+
+def note_input_keyboard() -> InlineKeyboardMarkup:
+    """Shown while waiting for the note text, so the step is never a trap."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Skip", callback_data="note:skip")]])
 
 
 def browse_keyboard(candidate_id: int, can_go_back: bool = False) -> InlineKeyboardMarkup:
@@ -161,6 +180,11 @@ def esc(value: object) -> str:
     return html.escape(str(value if value is not None else ""), quote=False)
 
 
+def note_line(note: str | None) -> str:
+    """A profile note, as its own block. Empty string when there is no note."""
+    return f"\n\n{esc(note)}" if note else ""
+
+
 def render_profile(profile: Profile, event_name: str) -> str:
     """The user's own profile — they may see everything about themselves."""
     needs = "Open to anyone" if profile.open_to_any or not profile.skills_needed else format_skills(profile.skills_needed)
@@ -173,6 +197,7 @@ def render_profile(profile: Profile, event_name: str) -> str:
         f"Status: {esc(STATUS_LABELS.get(profile.team_status, profile.team_status))}\n\n"
         f"You offer: {esc(format_skills(profile.skills_offered))}\n"
         f"You're looking for: {esc(needs)}"
+        f"{note_line(profile.note)}"
         f"{status_note}"
     )
 
@@ -191,6 +216,9 @@ def _candidate_body(candidate: ScoredCandidate) -> str:
     ]
     if candidate.needs_from_me:
         lines.append(f"You have what they want: {esc(format_skills(candidate.needs_from_me))}")
+    if p.note:
+        lines.append("")
+        lines.append(esc(p.note))
     return "\n".join(lines)
 
 

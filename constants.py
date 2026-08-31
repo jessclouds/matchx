@@ -59,6 +59,21 @@ SKILL_LABELS: Final[dict[str, str]] = dict(SKILLS)
 
 MAX_SKILLS: Final[int] = 3
 
+# Optional free-text note on a profile. Display only — never used for matching.
+NOTE_MAX_LENGTH: Final[int] = 160
+
+NOTE_PROMPT: Final[str] = (
+    "Want to add a short note to your profile?\n"
+    "<i>e.g. preferred hackathon track/topic, what you're building, or what kind of "
+    "teammate you're looking for</i>"
+)
+
+NOTE_ASK_TEXT: Final[str] = (
+    f"Send your note in one message (up to {NOTE_MAX_LENGTH} characters)."
+)
+
+NOTE_EXISTING_PROMPT: Final[str] = "Your note:\n\n{note}\n\nReplace it, or remove it?"
+
 OFFER_QUESTION: Final[dict[str, str]] = {
     "looking": f"What can you bring to a team? (pick up to {MAX_SKILLS})",
     "has_team": f"What does your team already have? (pick up to {MAX_SKILLS})",

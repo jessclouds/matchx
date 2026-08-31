@@ -14,7 +14,8 @@ Ranking is lexicographic on:
   3. len(user.offers ∩ candidate.needs)
   4. exact ties are rotated/randomised
 
-Discipline is DISPLAY ONLY — it never affects eligibility or ranking.
+Discipline and the optional profile note are DISPLAY ONLY — they never affect
+eligibility or ranking.
 Team status only establishes that the user is actively looking — it is never scored.
 """
 
@@ -41,6 +42,7 @@ class Profile:
     skills_needed: tuple[str, ...] = ()
     open_to_any: bool = False
     is_active: bool = True
+    note: str | None = None     # display only, like discipline
 
     @property
     def offers(self) -> frozenset[str]:

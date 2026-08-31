@@ -44,6 +44,16 @@ CREATE TABLE IF NOT EXISTS profiles (
 );
 
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS open_to_any BOOLEAN NOT NULL DEFAULT false;
+-- Optional free-text note shown on the participant's card. Display only: it never
+-- affects eligibility or ranking.
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS note TEXT;
+
+DO $$
+BEGIN
+    ALTER TABLE profiles ADD CONSTRAINT profiles_note_length CHECK (char_length(note) <= 160);
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END $$;
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS is_active   BOOLEAN NOT NULL DEFAULT true;
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS updated_at  TIMESTAMPTZ NOT NULL DEFAULT now();
 
