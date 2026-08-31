@@ -1,6 +1,5 @@
-python-telegram-bot==22.8
+# Runtime dependencies. This is what the deployment installs.
+python-telegram-bot[rate-limiter]==22.8
 python-dotenv==1.1.1
 psycopg[binary]==3.2.10
 psycopg_pool==3.2.6
-aiolimiter==1.2.1
-pytest==9.1.1

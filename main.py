@@ -1226,11 +1226,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(context.error, Conflict):
-        # Another poller holds this token — usually the previous process still
-        # shutting down. main() waits and takes over instead of dying.
-        global _conflict_seen
-        _conflict_seen = True
-        logger.warning("Another instance is polling this bot token.")
+        # Another poller holds this token — usually the previous instance still
+        # shutting down after a redeploy. python-telegram-bot keeps retrying and
+        # takes over once it stops, so this is a warning, not a failure.
+        logger.warning("Another instance is polling this bot token; waiting to take over.")
         return
 
     if isinstance(context.error, NetworkError):
@@ -1318,17 +1317,7 @@ def build_application() -> Application:
     return application
 
 
-_conflict_seen = False
-
-# A restart often overlaps the previous process by a second or two. Rather than dying,
-# wait for the old poller to let go and take over.
-CONFLICT_RETRIES = 6
-CONFLICT_BACKOFF_SECONDS = 5
-
-
 def main() -> None:
-    global _conflict_seen
-
     try:
         db.ping()
     except DatabaseError:
@@ -1337,31 +1326,17 @@ def main() -> None:
 
     logger.info("Hackathon Match starting…")
 
-    for attempt in range(1, CONFLICT_RETRIES + 1):
-        _conflict_seen = False
-        try:
-            build_application().run_polling(
-                allowed_updates=Update.ALL_TYPES, drop_pending_updates=True
-            )
-        except Conflict:
-            _conflict_seen = True
-        except KeyboardInterrupt:
-            break
-
-        if not _conflict_seen:
-            break                       # clean shutdown
-
-        wait = CONFLICT_BACKOFF_SECONDS * attempt
-        logger.warning(
-            "Waiting %ss for the previous instance to stop (attempt %s/%s)…",
-            wait, attempt, CONFLICT_RETRIES,
-        )
-        time.sleep(wait)
-    else:
-        logger.error(
-            "Another process is still polling this bot token. Stop it, then start again."
-        )
-        raise SystemExit(1)
+    # run_polling owns the process lifecycle: it installs handlers for SIGINT/SIGTERM
+    # (what Koyeb sends on stop and redeploy) and shuts down cleanly. It must be called
+    # exactly once — it closes the event loop on the way out.
+    #
+    # A redeploy usually overlaps the previous instance, which makes Telegram return
+    # Conflict on getUpdates. python-telegram-bot keeps retrying and takes over by
+    # itself once the old process lets go, so there is nothing to do here but log it
+    # quietly (see handle_error).
+    build_application().run_polling(
+        allowed_updates=Update.ALL_TYPES, drop_pending_updates=True
+    )
 
     logger.info("Hackathon Match stopped.")
 

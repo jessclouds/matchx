@@ -58,14 +58,31 @@ just a process that stays alive. While it is stopped, event links do nothing.
 
 Any always-on host works; the repo ships a `Dockerfile` and a `Procfile`.
 
-**Railway / Render / Fly.io (easiest):**
-1. Push this repo to GitHub
-2. Create a new project from the repo — the `Procfile` runs `python main.py` as a worker
-3. Add the environment variables `BOT_TOKEN`, `BOT_USERNAME`, `DATABASE_URL`
-   (and optionally `ORGANISER_IDS`) in the host's dashboard — never commit `.env`
-4. Deploy. The logs should show `Connected as @YourBot`
+**Koyeb (Worker service):**
+1. Push this repo to GitHub and create a **Worker** service from it (not Web —
+   long polling opens no port and needs no health check)
+2. Builder: **Dockerfile** (the repo has one), or Buildpack with
+   build `pip install -r requirements.txt` and run `python main.py`
+3. Set the environment variables below as **secrets** in the Koyeb dashboard
+4. Instance size: 512 MB is ample — measured ~44 MB in the container
+5. Scaling: keep **exactly one instance**. Two pollers on one bot token conflict;
+   the newer one waits and takes over, but you lose updates while they overlap.
 
-The database is already hosted (Supabase), so nothing else moves.
+Required: `BOT_TOKEN`, `BOT_USERNAME`, `DATABASE_URL`.
+Optional: `LOG_LEVEL` (default INFO), `ORGANISER_IDS`, `PERSISTENCE_FILE`
+(default `bot_state.pickle`; set `/tmp/bot_state.pickle` on an ephemeral filesystem).
+
+**Railway / Render / Fly.io:** same idea — the `Procfile` runs `python main.py` as a
+worker; set the same environment variables in the host's dashboard, never commit `.env`.
+
+The database is already hosted (Supabase), so nothing else moves. Nothing durable is
+written to local disk: profiles, interests, matches and events all live in Postgres.
+The only local file is the persistence pickle, which holds in-progress onboarding and
+browsing position — losing it on a redeploy costs a user at most their current
+questionnaire, never a profile, request or match.
+
+SIGTERM (what Koyeb sends on stop and redeploy) shuts the bot down cleanly and exits 0;
+measured at ~2 seconds.
 
 **Creating events without Telegram**
 

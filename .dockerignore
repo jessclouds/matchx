@@ -1,0 +1,23 @@
+# Never bake secrets or local state into the image
+.env
+.env.*
+!.env.example
+*.pickle
+bot_state.pickle
+
+# Local virtualenvs and caches
+.venv/
+.venv-1/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Not needed at runtime
+tests/
+selfcheck.py
+.git/
+.gitignore
+README.md
+*.md
+.DS_Store
