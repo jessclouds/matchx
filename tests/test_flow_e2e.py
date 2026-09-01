@@ -1046,6 +1046,16 @@ def test_add_note_saves_it_on_the_profile(world, event):
     assert NOTE in alice.all_text(), "the note appears on the user's own profile"
 
 
+def test_own_profile_shows_the_note_without_the_candidate_label(world, event):
+    """"User note:" labels someone else's words; on your own profile it is yours."""
+    alice = Session(world, ALICE, "alice")
+    onboard(alice, event, note=NOTE)
+    alice.clear()
+    alice.command("profile")
+    assert NOTE in alice.last.text
+    assert "User note:" not in alice.last.text
+
+
 def test_skip_leaves_the_profile_without_a_note(world, event):
     alice = Session(world, ALICE, "alice")
     onboard(alice, event)                       # default: taps Skip
@@ -1084,8 +1094,9 @@ def test_note_appears_at_the_bottom_of_a_candidate_card(world, event):
     alice.command("find")
     card = alice.last.text
     assert NOTE in card
+    assert f"User note: {NOTE}" in card, "the note must be labelled, not bare text"
     assert card.rstrip().endswith(NOTE), "the note sits at the bottom of the card"
-    assert card.index("Offers:") < card.index(NOTE)
+    assert card.index("Offers:") < card.index("User note:")
     assert "bob" not in card.lower(), "the note must not leak identity handling"
 
 
@@ -1111,7 +1122,7 @@ def test_note_shows_on_an_incoming_request_card(world, event):
     alice.command("find")
     alice.tap("Request Match")
     assert "wants to team up" in bob.all_text()
-    assert NOTE in bob.all_text()
+    assert f"User note: {NOTE}" in bob.all_text(), "request cards label the note too"
 
 
 def test_note_can_be_added_edited_and_removed_later(world, event):

@@ -217,8 +217,9 @@ def _candidate_body(candidate: ScoredCandidate) -> str:
     if candidate.needs_from_me:
         lines.append(f"You have what they want: {esc(format_skills(candidate.needs_from_me))}")
     if p.note:
+        # Labelled so the reader knows this is the participant's own words, not ours.
         lines.append("")
-        lines.append(esc(p.note))
+        lines.append(f"User note: {esc(p.note)}")
     return "\n".join(lines)
 
 

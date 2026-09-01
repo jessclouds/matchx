@@ -215,6 +215,26 @@ def test_note_is_escaped_on_cards():
     assert "&lt;b&gt;hi&lt;/b&gt; &amp; bye" in card
 
 
+def test_candidate_note_is_labelled():
+    import keyboards as kb
+    from matching import score
+
+    me = make(1, needs=("uiux",))
+    other = make(2, offers=("uiux",), note="Health-tech track, want to ship something.")
+    card = kb.render_candidate(score(me, other), remaining=0)
+    assert "User note: Health-tech track, want to ship something." in card
+    assert card.rstrip().endswith("something.")
+
+
+def test_card_without_a_note_has_no_label():
+    import keyboards as kb
+    from matching import score
+
+    me = make(1, needs=("uiux",))
+    card = kb.render_candidate(score(me, make(2, offers=("uiux",))), remaining=0)
+    assert "User note:" not in card
+
+
 def test_card_without_a_note_has_no_empty_block():
     import keyboards as kb
     from matching import score
