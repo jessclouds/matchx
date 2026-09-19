@@ -23,6 +23,8 @@ class Msg:
     chat_id: int
     text: str
     reply_markup: Any = None
+    kind: str | None = None          # 'photo' / 'video' / ... when media was sent
+    file_id: str | None = None
 
     def buttons(self) -> list:
         if not self.reply_markup:
@@ -39,6 +41,26 @@ class FakeChat:
         msg = Msg(self.id, text, reply_markup)
         self.world.inboxes[self.id].append(msg)
         return msg
+
+    async def _send_media(self, kind, file_id, caption=None, parse_mode=None):
+        if self.world.media_should_fail:
+            from telegram.error import BadRequest
+            raise BadRequest("wrong file identifier/HTTP URL specified")
+        msg = Msg(self.id, caption or "", None, kind=kind, file_id=file_id)
+        self.world.inboxes[self.id].append(msg)
+        return msg
+
+    async def send_photo(self, file_id, caption=None, parse_mode=None):
+        return await self._send_media("photo", file_id, caption, parse_mode)
+
+    async def send_video(self, file_id, caption=None, parse_mode=None):
+        return await self._send_media("video", file_id, caption, parse_mode)
+
+    async def send_animation(self, file_id, caption=None, parse_mode=None):
+        return await self._send_media("animation", file_id, caption, parse_mode)
+
+    async def send_document(self, file_id, caption=None, parse_mode=None):
+        return await self._send_media("document", file_id, caption, parse_mode)
 
 
 class FakeUser:
@@ -68,9 +90,20 @@ class FakeQuery:
 
 
 @dataclass
+class FakeFile:
+    """Stands in for PhotoSize / Video / Document — only file_id is ever read."""
+    file_id: str
+
+
+@dataclass
 class FakeMessage:
     text: str | None = None
     caption: str | None = None
+    photo: list | None = None
+    video: Any = None
+    animation: Any = None
+    document: Any = None
+    media_group_id: str | None = None
 
 
 class FakeUpdate:
@@ -111,6 +144,7 @@ class World:
         self.chat_data: dict[int, dict] = defaultdict(dict)
         self.bot_data: dict = {}
         self.alerts: list[tuple[int, str | None, bool]] = []
+        self.media_should_fail = False        # flip to simulate Telegram rejecting a file
         self.bot = FakeBot(self)
 
     def command_handler(self, name: str) -> Callable:
@@ -190,6 +224,18 @@ class Session:
     def say(self, text: str):
         handler = self.world.message_handler()
         update = FakeUpdate(self.user, self.chat, message=FakeMessage(text=text))
+        return run(handler(update, FakeContext(self.world, self.user.id)))
+
+    def send_media(self, kind: str, *, caption: str | None = None,
+                   file_id: str = "FILEID123", media_group_id: str | None = None):
+        """Forward a poster/clip the way Telegram delivers one: words in `caption`."""
+        fields = {"caption": caption, "media_group_id": media_group_id}
+        if kind == "photo":
+            fields["photo"] = [FakeFile(file_id + "_small"), FakeFile(file_id)]
+        else:
+            fields[kind] = FakeFile(file_id)
+        handler = self.world.message_handler()
+        update = FakeUpdate(self.user, self.chat, message=FakeMessage(**fields))
         return run(handler(update, FakeContext(self.world, self.user.id)))
 
     def tap(self, needle: str):

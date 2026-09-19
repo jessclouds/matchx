@@ -19,6 +19,7 @@ pytestmark = pytest.mark.skipif(
 
 import db  # noqa: E402
 import main  # noqa: E402
+import keyboards as kb  # noqa: E402
 from fake_telegram import Session, World  # noqa: E402
 
 ALICE, BOB, CAROL, DAVE, ORGANISER = (910_000_001, 910_000_002, 910_000_003, 910_000_004, 910_000_009)
@@ -1415,3 +1416,184 @@ def test_participants_have_no_cap_on_hackathons_joined(world):
         joined.append(code)
     rows = {r["event_code"] for r in db.list_profiles_for_user(ALICE)}
     assert set(joined).issubset(rows), "a participant must be able to join any number of events"
+
+
+# ------------------------------- /newevent with photo / video announcements
+
+CTA_MARK = "Looking for teammates?"
+
+
+def _start_newevent(world, name="Poster Hack"):
+    organiser = Session(world, ORGANISER, "organiser")
+    organiser.command("newevent")
+    organiser.say(name)
+    organiser.clear()
+    return organiser
+
+
+def _link_of(msgs) -> str:
+    for m in msgs:
+        if "?start=" in (m.text or ""):
+            return m.text.split("?start=")[1].split()[0].strip()
+    raise AssertionError(f"no participant link in {[m.text for m in msgs]}")
+
+
+def test_plain_text_announcement_is_unchanged(world):
+    organiser = _start_newevent(world)
+    organiser.say("IDEATE 2026\nBuild health-tech in 48 hours.")
+    post = organiser.inbox[0]
+    world._created_events.append(_link_of(organiser.inbox))
+    assert "Build health-tech in 48 hours." in post.text
+    assert CTA_MARK in post.text
+    assert post.kind is None, "a text announcement must not become media"
+
+
+def test_photo_with_caption_keeps_media_caption_and_link(world):
+    organiser = _start_newevent(world)
+    organiser.send_media("photo", caption="IDEATE 2026 — poster")
+    post = organiser.inbox[0]
+    world._created_events.append(_link_of(organiser.inbox))
+    assert post.kind == "photo" and post.file_id == "FILEID123"
+    assert "IDEATE 2026 — poster" in post.text
+    assert CTA_MARK in post.text and "?start=" in post.text
+
+
+def test_photo_without_caption_uses_the_cta_as_caption(world):
+    organiser = _start_newevent(world)
+    organiser.send_media("photo")
+    post = organiser.inbox[0]
+    world._created_events.append(_link_of(organiser.inbox))
+    assert post.kind == "photo"
+    assert CTA_MARK in post.text and "?start=" in post.text
+
+
+def test_video_with_caption_keeps_media_caption_and_link(world):
+    organiser = _start_newevent(world)
+    organiser.send_media("video", caption="Watch our hype video")
+    post = organiser.inbox[0]
+    world._created_events.append(_link_of(organiser.inbox))
+    assert post.kind == "video"
+    assert "Watch our hype video" in post.text and CTA_MARK in post.text
+
+
+def test_video_without_caption_still_carries_the_link(world):
+    organiser = _start_newevent(world)
+    organiser.send_media("video")
+    post = organiser.inbox[0]
+    world._created_events.append(_link_of(organiser.inbox))
+    assert post.kind == "video" and "?start=" in post.text
+
+
+def test_document_announcement_is_accepted(world):
+    organiser = _start_newevent(world)
+    organiser.send_media("document", caption="Poster PDF")
+    post = organiser.inbox[0]
+    world._created_events.append(_link_of(organiser.inbox))
+    assert post.kind == "document" and CTA_MARK in post.text
+
+
+def test_long_caption_keeps_announcement_and_sends_cta_separately(world):
+    """The caption limit is 1024 — far tighter than a text message's 4096."""
+    long_caption = "A" * 1000
+    organiser = _start_newevent(world)
+    organiser.send_media("photo", caption=long_caption)
+    world._created_events.append(_link_of(organiser.inbox))
+
+    media = organiser.inbox[0]
+    assert media.kind == "photo"
+    assert media.text == long_caption, "the organiser's words must not be truncated"
+    assert CTA_MARK not in media.text
+    follow_up = organiser.inbox[1]
+    assert CTA_MARK in follow_up.text and "?start=" in follow_up.text
+
+
+def test_media_rejected_by_telegram_still_surfaces_the_link(world):
+    organiser = _start_newevent(world)
+    world.media_should_fail = True
+    try:
+        organiser.send_media("photo", caption="Poster that will not send")
+    finally:
+        world.media_should_fail = False
+    text = organiser.all_text()
+    world._created_events.append(_link_of(organiser.inbox))
+    assert "?start=" in text and CTA_MARK in text, "the link must never be lost"
+    assert "couldn't re-send that attachment" in text
+
+
+def test_message_with_neither_text_nor_media_is_not_silently_dropped(world):
+    organiser = _start_newevent(world)
+    organiser.say("   ")
+    assert "couldn't read an announcement" in organiser.last.text
+    assert "/cancel" in organiser.last.text
+
+
+def test_media_cta_link_matches_the_created_event(world):
+    organiser = _start_newevent(world)
+    organiser.send_media("photo", caption="Poster")
+    code = _link_of(organiser.inbox)
+    world._created_events.append(code)
+    row = db.get_event_row(code)
+    assert row is not None and row["organiser_telegram_id"] == ORGANISER
+    assert db.get_event(code) == "Poster Hack"
+
+
+def test_duplicate_media_update_creates_one_event_and_one_link(world):
+    organiser = _start_newevent(world)
+    organiser.send_media("photo", caption="Poster")
+    code = _link_of(organiser.inbox)
+    world._created_events.append(code)
+    before = db.list_events_for_organiser(ORGANISER)
+
+    organiser.send_media("photo", caption="Poster")     # replayed update
+    after = db.list_events_for_organiser(ORGANISER)
+    assert len(after) == len(before), "a replayed update must not create a second event"
+    links = {m.text.split("?start=")[1].split()[0] for m in organiser.inbox if "?start=" in (m.text or "")}
+    assert links == {code}, f"exactly one participant link expected, got {links}"
+
+
+def test_album_yields_one_event_and_one_link(world):
+    organiser = _start_newevent(world)
+    organiser.send_media("photo", caption="Poster 1 of 3", media_group_id="ALBUM1")
+    code = _link_of(organiser.inbox)
+    world._created_events.append(code)
+    before = len(db.list_events_for_organiser(ORGANISER))
+
+    organiser.send_media("photo", file_id="FILEID2", media_group_id="ALBUM1")
+    organiser.send_media("photo", file_id="FILEID3", media_group_id="ALBUM1")
+
+    assert len(db.list_events_for_organiser(ORGANISER)) == before
+    links = {m.text.split("?start=")[1].split()[0] for m in organiser.inbox if "?start=" in (m.text or "")}
+    assert links == {code}, f"one album must yield exactly one link, got {links}"
+
+
+def test_cancel_during_the_announcement_step_still_works(world):
+    organiser = _start_newevent(world)
+    before = len(db.list_events_for_organiser(ORGANISER))
+    organiser.command("cancel")
+    assert "Cancelled" in organiser.last.text
+    organiser.send_media("photo", caption="too late")
+    assert len(db.list_events_for_organiser(ORGANISER)) == before, "cancel must clear the step"
+
+
+def test_escape_heavy_caption_never_exceeds_telegram_limits(world):
+    """HTML-escaping can expand a caption 5x ("&" -> "&amp;").
+
+    A 1024-character caption Telegram happily accepted becomes 5120 escaped, which no
+    longer fits a single text message either. The announcement must still arrive whole
+    and the link must still arrive, split across messages that each fit.
+    """
+    raw = "&" * 1024
+    organiser = _start_newevent(world)
+    organiser.send_media("photo", caption=raw)
+    world._created_events.append(_link_of(organiser.inbox))
+
+    media = organiser.inbox[0]
+    assert media.kind == "photo"
+    for msg in organiser.inbox:
+        assert len(msg.text or "") <= kb.TELEGRAM_MAX_CHARS, "no message may exceed the text limit"
+    assert (media.text or "") == "" or len(media.text) <= kb.CAPTION_MAX_CHARS
+
+    import html as _html
+    sent = _html.unescape(" ".join(m.text or "" for m in organiser.inbox))
+    assert raw in sent.replace(" ", ""), "the organiser's announcement must survive intact"
+    assert CTA_MARK in sent and "?start=" in sent

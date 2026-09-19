@@ -1229,6 +1229,39 @@ async def capture_event_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+def announcement_media(message) -> tuple[str | None, str | None]:
+    """(kind, file_id) for a poster or clip we can echo straight back, else (None, None).
+
+    Real hackathon announcements are usually a poster or a short video, forwarded from
+    a channel. Telegram puts those words in `caption`, not `text`, and the file itself
+    is referenced by a file_id we can re-send without ever downloading it.
+    Animations are checked before documents because Telegram sets both for a GIF.
+    """
+    if message is None:
+        return None, None
+    if message.photo:
+        return "photo", message.photo[-1].file_id      # last entry is the largest size
+    if message.video:
+        return "video", message.video.file_id
+    if message.animation:
+        return "animation", message.animation.file_id
+    if message.document:
+        return "document", message.document.file_id
+    return None, None
+
+
+async def send_media(update: Update, kind: str, file_id: str, caption: str) -> None:
+    """Re-send the organiser's media by file_id — no download, no re-upload."""
+    chat = update.effective_chat
+    sender = {
+        "photo": chat.send_photo,
+        "video": chat.send_video,
+        "animation": chat.send_animation,
+        "document": chat.send_document,
+    }[kind]
+    await sender(file_id, caption=caption or None, parse_mode=ParseMode.HTML)
+
+
 @db_guard
 async def create_event_from_announcement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Turn a pasted/forwarded announcement into an isolated event pool + share link.
@@ -1243,9 +1276,18 @@ async def create_event_from_announcement(update: Update, context: ContextTypes.D
         await send(update, "Let's start with the name — what's the hackathon called?")
         return
 
-    announcement = (update.message.text or update.message.caption or "").strip()
-    if not announcement:
-        await send(update, "I couldn't read any text there. Paste the announcement, or /cancel.")
+    message = update.message
+    kind, file_id = announcement_media(message)
+    announcement = (message.text or message.caption or "").strip()
+
+    # A poster with no words is a perfectly good announcement — the link becomes its
+    # caption. Only a message with neither words nor media is unusable.
+    if not announcement and not kind:
+        await send(
+            update,
+            "I couldn't read an announcement there. Send the text, or forward the "
+            "poster or video, or /cancel.",
+        )
         return
 
     context.user_data.pop("mode", None)          # state is per organiser (user_data)
@@ -1258,9 +1300,35 @@ async def create_event_from_announcement(update: Update, context: ContextTypes.D
     STATS.record_action("event_created")
     logger.info("Organiser %s created event %s", organiser_id, event_code)
 
+    # Remember the album this came from, so the rest of its items are ignored rather
+    # than answered separately. One forwarded album must yield one event, one link.
+    if message.media_group_id:
+        context.user_data["handled_media_group"] = message.media_group_id
+
     # 1. The ready-to-post message — nothing else in it, so it pastes cleanly.
-    for part in kb.render_event_post(announcement, link):
-        await send(update, part)
+    if kind:
+        caption, follow_ups = kb.render_media_caption(announcement, link)
+        try:
+            await send_media(update, kind, file_id, caption)
+        except TelegramError as exc:
+            # Telegram refused the file (unsupported type, expired file_id, …). The
+            # link must never be the casualty, so fall back to the text post and say
+            # what happened rather than leaving the organiser with nothing.
+            STATS.record_telegram("failed")
+            logger.warning("Could not re-send %s for event %s: %s", kind, event_code, exc)
+            for part in kb.render_event_post(announcement, link):
+                await send(update, part)
+            await send(
+                update,
+                "I couldn't re-send that attachment, so here is the announcement as text. "
+                "Post your original file alongside the link above.",
+            )
+        else:
+            for part in follow_ups:
+                await send(update, part)
+    else:
+        for part in kb.render_event_post(announcement, link):
+            await send(update, part)
 
     # 2. Instructions, kept separate so they are not copied along with the post.
     await send(
@@ -1361,6 +1429,13 @@ async def handle_event_close_confirm(update: Update, context: ContextTypes.DEFAU
 
 @db_guard
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Telegram delivers an album as several updates sharing one media_group_id. The
+    # first became the event; the rest would otherwise each get their own reply, so
+    # they are dropped. One album -> one event -> one link.
+    group_id = getattr(update.message, "media_group_id", None)
+    if group_id and group_id == context.user_data.get("handled_media_group"):
+        return
+
     mode = context.user_data.get("mode")
     if mode == "await_event_name":
         await capture_event_name(update, context)
@@ -1512,7 +1587,15 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(handle_event_close_confirm, pattern=r"^(evcloseyes:|evcloseno$)"))
     application.add_handler(CallbackQueryHandler(handle_event_switch, pattern=r"^ev:"))
 
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Organisers forward posters and clips, where the words live in `caption`, not
+    # `text`. A TEXT-only filter silently dropped those updates, leaving /newevent
+    # waiting forever, so every message type the announcement step can use is routed
+    # here. Non-announcement media still lands on the usual "I work with buttons".
+    application.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.ALL)
+        & ~filters.COMMAND,
+        handle_message,
+    ))
     application.add_error_handler(handle_error)
     return application
 

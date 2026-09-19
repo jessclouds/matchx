@@ -15,6 +15,7 @@ from __future__ import annotations
 import html
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import MessageLimit
 
 from constants import (
     DISCIPLINE_LABELS,
@@ -315,6 +316,71 @@ CTA_BLOCK = (
     "sides are interested.\n"
     "<b>Find teammates:</b> {link}"
 )
+
+
+# A media caption is capped far lower than message text (1024 vs 4096), so an
+# announcement that fits fine as text can easily not fit as a caption.
+CAPTION_MAX_CHARS = MessageLimit.CAPTION_LENGTH
+
+
+def _split_for_text(raw: str, limit: int) -> list[str]:
+    """Escape `raw` and split it into messages that each fit `limit`.
+
+    The split is chosen on the raw text and each piece escaped separately, so a chunk
+    boundary can never land inside an HTML entity and produce a stray "&am". Prefers
+    to break at a newline, then a space, so the announcement stays readable.
+    """
+    pieces: list[str] = []
+    remaining = raw
+    while remaining:
+        if len(esc(remaining)) <= limit:
+            pieces.append(esc(remaining))
+            break
+        # Longest prefix whose escaped form still fits.
+        lo, hi = 1, len(remaining)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if len(esc(remaining[:mid])) <= limit:
+                lo = mid
+            else:
+                hi = mid - 1
+        cut = lo
+        window = remaining[:cut]
+        nicer = max(window.rfind("\n"), window.rfind(" "))
+        if nicer > cut // 2:                      # only if it does not waste the chunk
+            cut = nicer + 1
+        pieces.append(esc(remaining[:cut]))
+        remaining = remaining[cut:].lstrip()
+    return pieces
+
+
+def render_media_caption(caption: str, link: str) -> tuple[str, list[str]]:
+    """Work out how to attach the MatchX call-to-action to a poster or video.
+
+    Returns (caption_to_send, follow_up_messages).
+
+    The organiser's own words are never truncated to make the link fit. When the two
+    cannot share one caption the caption goes out unchanged and the call-to-action
+    follows as its own message, because the one thing that must always survive is the
+    join link — without it the post is useless to participants.
+    """
+    cta = CTA_BLOCK.format(link=esc(link))
+    body = esc(caption.strip())
+
+    if not body:                                    # poster with no words of its own
+        return cta, []
+
+    combined = f"{body}\n\n{cta}"
+    if len(combined) <= CAPTION_MAX_CHARS:
+        return combined, []
+    if len(body) <= CAPTION_MAX_CHARS:
+        return body, [cta]                          # caption intact, link follows
+
+    # Escaping can push even a caption Telegram accepted past the caption limit — a
+    # 1024-character caption of "&" becomes 5120. Send the media bare and follow with
+    # the announcement as text, split if it still does not fit, and the call-to-action
+    # last in a message of its own so the link can never be the part that is dropped.
+    return "", _split_for_text(caption.strip(), TELEGRAM_MAX_CHARS) + [cta]
 
 
 def render_event_post(announcement: str, link: str) -> list[str]:
