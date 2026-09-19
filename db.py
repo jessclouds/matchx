@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import logging
+import os
 import time
 import random
 import re
@@ -24,6 +25,7 @@ from psycopg.rows import dict_row
 from config import require_database_url
 from constants import ALL_SKILL_VALUES
 from matching import Profile
+from metrics import STATS
 
 logger = logging.getLogger(__name__)
 
@@ -46,22 +48,42 @@ class DatabaseError(RuntimeError):
     """Raised for any database failure. The message is for logs, never for users."""
 
 
+# Pool sizing is bounded by the CONNECTION POOLER, not by Postgres.
+#
+# Postgres reports max_connections=60, but we connect through Supabase's Supavisor
+# session pooler (port 5432), which pins one backend per client and enforces its own
+# per-project client cap. Probing it directly, connection 15 is refused with
+# "FATAL: (EMAXCONNSESSION) max clients reached" — so the real ceiling is ~14, not 60.
+# Sizing from the Postgres figure is how you end up with a pool that cannot open.
+#
+# 10 leaves roughly 4 spare for selfcheck.py, a psql session, or a deploy that briefly
+# overlaps the previous instance. Raising this is NOT the way to get more concurrency:
+# the session pooler cannot give it. That would need the transaction pooler (port 6543,
+# which multiplexes many clients) together with prepare_threshold=None, which is a
+# deliberate change to make after a launch, not during one.
+POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
+POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", "2"))
+# How long a caller waits for a free connection before being told to try again.
+# Kept short on purpose: under real saturation a long wait only stacks up callers.
+POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "5"))
+
 try:
-    from psycopg_pool import ConnectionPool
+    from psycopg_pool import ConnectionPool, PoolTimeout
 
     _pool: "ConnectionPool | None" = ConnectionPool(
         DATABASE_URL,
-        min_size=1,
-        max_size=10,
+        min_size=POOL_MIN_SIZE,
+        max_size=POOL_MAX_SIZE,
         max_idle=120,
         max_lifetime=1800,
-        timeout=15,
+        timeout=POOL_TIMEOUT,
         check=ConnectionPool.check_connection,
         kwargs={"row_factory": dict_row, "connect_timeout": 10},
         open=False,
     )
 except ImportError:  # pragma: no cover - pool is a soft dependency
     _pool = None
+    PoolTimeout = ()  # type: ignore[assignment]
     logger.info("psycopg_pool not installed — using one connection per query.")
 
 
@@ -87,16 +109,42 @@ def _run(fn: Callable[[psycopg.Cursor], T]) -> T:
 
     Supabase's pooler drops idle connections, so a dead-connection failure is
     retried once with a fresh connection before it is reported as an error.
+
+    A pool timeout is deliberately NOT retried. It means every connection is busy,
+    and waiting the full timeout a second time only doubles the stall (15s+15s=30s
+    with the old settings) while still holding a worker thread — which makes a busy
+    moment worse for everyone. Saturation fails fast so the caller gets the "try
+    again in a moment" message promptly.
     """
     last_error: Exception | None = None
 
     for attempt in (1, 2):
+        started = time.monotonic()
         try:
             with get_connection() as conn:
                 with conn.cursor() as cur:
                     result = fn(cur)
-                conn.commit()
+                try:
+                    conn.commit()
+                except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+                    # The connection died while committing, so whether the work landed
+                    # is genuinely unknown. Retrying could apply it a second time, or
+                    # report "already done" for something this caller did itself — which
+                    # is how a match can be created without its requester being told.
+                    # Ambiguity is not retryable: surface it and let the user act again
+                    # against writes that are all idempotent.
+                    STATS.record_error()
+                    logger.error("Connection lost during commit — outcome unknown, not retrying: %s", exc)
+                    raise DatabaseError(f"commit outcome unknown: {exc}") from exc
+                STATS.record_query(time.monotonic() - started)
                 return result
+        except PoolTimeout as exc:
+            STATS.record_pool_timeout()
+            logger.warning(
+                "Database pool saturated (all %s connections busy after %.1fs) — failing fast.",
+                POOL_MAX_SIZE, POOL_TIMEOUT,
+            )
+            raise DatabaseError(str(exc)) from exc
         except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
             last_error = exc
             logger.warning("Database connection problem (attempt %s/2): %s", attempt, exc)
@@ -104,9 +152,11 @@ def _run(fn: Callable[[psycopg.Cursor], T]) -> T:
                 time.sleep(0.25)      # brief backoff before the single retry
             continue
         except psycopg.Error as exc:
+            STATS.record_error()
             logger.exception("Database operation failed: %s", type(exc).__name__)
             raise DatabaseError(str(exc)) from exc
 
+    STATS.record_error()
     logger.error("Database unreachable after retry: %s", last_error)
     raise DatabaseError(str(last_error)) from last_error
 
@@ -217,15 +267,57 @@ def create_event(
     return _run(q)
 
 
+def close_event_as_organiser(event_code: str, organiser_telegram_id: int) -> str:
+    """Close an event, but only for the organiser who created it.
+
+    Ownership is re-checked here against the database rather than trusted from the
+    callback that asked, so a forged button cannot close somebody else's hackathon.
+    Nothing is deleted: profiles, interests, matches and already-revealed usernames
+    all stay exactly as they are. Closing only stops new matchmaking.
+
+    Returns 'closed', 'already_closed', 'not_owner' or 'not_found'.
+    """
+
+    def q(cur: psycopg.Cursor) -> str:
+        cur.execute(
+            "SELECT organiser_telegram_id, is_active FROM events WHERE event_code = %s FOR UPDATE",
+            (event_code,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return "not_found"
+        if row["organiser_telegram_id"] != organiser_telegram_id:
+            return "not_owner"
+        if not row["is_active"]:
+            return "already_closed"
+        cur.execute("UPDATE events SET is_active = false WHERE event_code = %s", (event_code,))
+        return "closed"
+
+    return _run(q)
+
+
+def count_active_events_for_organiser(organiser_telegram_id: int) -> int:
+    """Open events this organiser owns — the cap /newevent enforces against spam."""
+
+    def q(cur: psycopg.Cursor) -> int:
+        cur.execute(
+            "SELECT count(*) AS n FROM events WHERE organiser_telegram_id = %s AND is_active",
+            (organiser_telegram_id,),
+        )
+        return cur.fetchone()["n"]
+
+    return _run(q)
+
+
 def list_events_for_organiser(organiser_telegram_id: int) -> list[dict[str, Any]]:
     def q(cur: psycopg.Cursor) -> list[dict[str, Any]]:
         cur.execute(
             """
-            SELECT e.event_code, e.name, e.created_at,
+            SELECT e.event_code, e.name, e.created_at, e.is_active,
                    (SELECT count(*) FROM profiles p WHERE p.event_code = e.event_code) AS participants
             FROM events e
             WHERE e.organiser_telegram_id = %s
-            ORDER BY e.created_at DESC
+            ORDER BY e.is_active DESC, e.created_at DESC
             LIMIT 20
             """,
             (organiser_telegram_id,),
@@ -342,10 +434,10 @@ def list_profiles_for_user(telegram_user_id: int) -> list[dict[str, Any]]:
     def q(cur: psycopg.Cursor) -> list[dict[str, Any]]:
         cur.execute(
             """
-            SELECT p.event_code, e.name
+            SELECT p.event_code, e.name, e.is_active
             FROM profiles p JOIN events e USING (event_code)
             WHERE p.telegram_user_id = %s
-            ORDER BY p.updated_at DESC
+            ORDER BY e.is_active DESC, p.updated_at DESC
             """,
             (telegram_user_id,),
         )
@@ -488,6 +580,36 @@ def count_interactions(event_code: str, telegram_user_id: int) -> int:
     return _run(q)
 
 
+def empty_state_counts(event_code: str, telegram_user_id: int) -> tuple[int, int, int]:
+    """(skipped, interactions, active_others) in one round trip.
+
+    Only needed when browsing has run out of candidates — the wording of that screen
+    depends on all three. Late in a hackathon most people are in exactly that state,
+    so this is a hot path; asking three separate times tripled its cost for nothing.
+    Returns exactly what count_skipped / count_interactions / count_active_others do.
+    """
+
+    def q(cur: psycopg.Cursor) -> tuple[int, int, int]:
+        cur.execute(
+            """
+            SELECT
+                (SELECT count(*) FROM interests
+                  WHERE event_code = %(event)s AND from_user_id = %(me)s
+                    AND status = 'skipped')                        AS skipped,
+                (SELECT count(*) FROM interests
+                  WHERE event_code = %(event)s AND from_user_id = %(me)s) AS interactions,
+                (SELECT count(*) FROM profiles
+                  WHERE event_code = %(event)s AND is_active
+                    AND telegram_user_id <> %(me)s)                AS others
+            """,
+            {"event": event_code, "me": telegram_user_id},
+        )
+        row = cur.fetchone()
+        return row["skipped"], row["interactions"], row["others"]
+
+    return _run(q)
+
+
 def get_event_pool(event_code: str) -> list[Profile]:
     """Every active profile in one event.
 
@@ -507,6 +629,15 @@ def get_event_pool(event_code: str) -> list[Profile]:
 
 
 # ------------------------------------------------------------------ interests
+
+
+def _event_is_open(cur: psycopg.Cursor, event_code: str) -> bool:
+    """False once a hackathon is closed. Browsing already filters on this, but a card
+    already on someone's screen can still be tapped after closure, so the write paths
+    check too."""
+    cur.execute("SELECT is_active FROM events WHERE event_code = %s", (event_code,))
+    row = cur.fetchone()
+    return bool(row and row["is_active"])
 
 
 def _pair_lock(cur: psycopg.Cursor, event_code: str, a: int, b: int) -> None:
@@ -603,11 +734,14 @@ def request_match(event_code: str, from_user_id: int, to_user_id: int) -> str:
       'matched'         — B had already asked A, so this completes a mutual match
       'already_matched' — they are already matched
       'invalid'         — self-request or missing profile
+      'closed'          — the hackathon has closed; no new matchmaking
     """
     if from_user_id == to_user_id:
         return "invalid"
 
     def q(cur: psycopg.Cursor) -> str:
+        if not _event_is_open(cur, event_code):
+            return "closed"
         _pair_lock(cur, event_code, from_user_id, to_user_id)
 
         cur.execute(
@@ -672,12 +806,15 @@ def request_match(event_code: str, from_user_id: int, to_user_id: int) -> str:
 def respond_to_request(event_code: str, requester_id: int, responder_id: int, accept: bool) -> str:
     """B answers A's request.
 
-    Returns 'matched', 'declined', 'already_matched', 'already_declined' or 'not_found'.
+    Returns 'matched', 'declined', 'already_matched', 'already_declined',
+    'not_found', or 'closed' when the hackathon has closed.
     """
     if requester_id == responder_id:
         return "not_found"
 
     def q(cur: psycopg.Cursor) -> str:
+        if not _event_is_open(cur, event_code):
+            return "closed"
         _pair_lock(cur, event_code, requester_id, responder_id)
 
         cur.execute(

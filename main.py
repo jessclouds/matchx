@@ -8,13 +8,16 @@ mutual yes.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Awaitable, Callable
 
 from telegram import BotCommand, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, TelegramError
+from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -47,6 +50,7 @@ from constants import (
 )
 from db import DatabaseError, run_db
 from matching import Profile, rank_candidates, score
+from metrics import STATS
 
 setup_logging()
 logger = logging.getLogger("hackathon_match")
@@ -54,6 +58,17 @@ logger = logging.getLogger("hackathon_match")
 TOKEN = require_bot_token()
 
 DB_ERROR_TEXT = "I couldn't reach the database just now. Please try again in a moment."
+
+# Every db.* call runs in a worker thread via run_db(). Python's default executor is
+# min(32, cpu_count + 4) threads — about 6 on a small Railway box, which would cap the
+# bot at ~6 database operations at once no matter how big the connection pool is.
+# Sized just above db.POOL_MAX_SIZE so the pool is the limiter rather than an invisible
+# thread shortage: the pool has a timeout and a fail-fast path, a thread famine has
+# neither. There is no point going far above it — the pooler cannot serve more.
+DB_EXECUTOR_WORKERS = int(os.getenv("DB_EXECUTOR_WORKERS", str(db.POOL_MAX_SIZE + 2)))
+
+# How often the one-line health heartbeat is written to stdout (Railway logs).
+HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "60"))
 
 # Onboarding order. Each answer either chains to the next step or, when the user is
 # editing a single field, saves and returns to the profile screen.
@@ -89,10 +104,16 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, re
         await context.bot.send_message(
             chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode=ParseMode.HTML
         )
+        STATS.record_telegram("sent")
         return True
     except Forbidden:
+        STATS.record_telegram("blocked")
         logger.info("User %s has blocked the bot; notification dropped.", user_id)
+    except RetryAfter as exc:
+        STATS.record_telegram("retry_after")
+        logger.warning("Telegram flood limit notifying %s: retry after %ss", user_id, exc.retry_after)
     except TelegramError as exc:
+        STATS.record_telegram("failed")
         logger.warning("Could not notify %s: %s", user_id, exc)
     return False
 
@@ -184,6 +205,22 @@ def db_guard(handler: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable
 
 
 # --------------------------------------------------------------- abuse guard
+
+# /matches sends one card per pending request, each with its own buttons. Capped so a
+# popular participant cannot trigger a burst Telegram throttles (1 msg/s per chat).
+MAX_REQUEST_CARDS_PER_RUN = 5
+
+# Event-creation abuse limits. /newevent stays open to everyone — no whitelist — but a
+# single account cannot mass-create. Two independent bounds:
+#   * how many open events one organiser may hold at once, and
+#   * how many they may create per hour.
+# The hourly limit deliberately tolerates a burst: creating two or three events
+# back-to-back is normal (parallel tracks, or redoing one after a typo), so a flat
+# cooldown between consecutive creations would block legitimate organisers. Only a
+# scripted loop reaches the hourly figure.
+MAX_ACTIVE_EVENTS_PER_ORGANISER = 10
+MAX_EVENTS_PER_HOUR_PER_ORGANISER = 5
+EVENT_RATE_WINDOW_SECONDS = 3600
 
 # A single bot process, so a bounded in-memory window is enough: it costs nothing,
 # survives nothing (which is fine for spam control) and cannot grow without limit.
@@ -700,9 +737,9 @@ async def find_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
-        skipped = await run_db(db.count_skipped, profile.event_code, user_id)
-        seen = await run_db(db.count_interactions, profile.event_code, user_id)
-        others = await run_db(db.count_active_others, profile.event_code, user_id)
+        skipped, seen, others = await run_db(
+            db.empty_state_counts, profile.event_code, user_id
+        )
         if skipped:
             text = ("That's everyone new for now.\n\n"
                     "You can look again at the people you skipped, or widen what you're "
@@ -867,6 +904,16 @@ async def handle_request(
         await find_matches(update, context)
         return
 
+    if result == "closed":
+        await query.answer("This hackathon has closed.", show_alert=True)
+        await safe_edit(
+            query,
+            f"<b>{kb.esc(event_name)}</b> has closed, so no new requests can be sent. "
+            "Your existing matches are still in /matches.",
+            reply_markup=kb.home_keyboard(),
+        )
+        return
+
     if result == "invalid":
         await query.answer()
         await find_matches(update, context)
@@ -915,6 +962,16 @@ async def handle_response(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     context.user_data.setdefault("event_code", event_code)
     result = await run_db(db.respond_to_request, event_code, requester_id, me_id, accept)
+
+    if result == "closed":
+        await query.answer("This hackathon has closed.", show_alert=True)
+        await safe_edit(
+            query,
+            "This hackathon has closed, so new matches can't be made. "
+            "Your existing matches are still in /matches.",
+            reply_markup=kb.home_keyboard(),
+        )
+        return
 
     if result in ("not_found", "already_declined"):
         await query.answer("That request is no longer open.", show_alert=True)
@@ -971,27 +1028,36 @@ async def matches_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
+    # Telegram allows about one message per second to a single chat. The summary parts
+    # are therefore sent as ONE message rather than three, and the request cards — which
+    # each need their own Accept/Decline buttons, so they cannot be merged — are capped
+    # per run. Someone popular with twenty pending requests used to trigger twenty-three
+    # sends in a burst, which Telegram throttles and can drop.
+    summary: list[str] = []
     if matches:
-        header = f"<b>Your matches ({len(matches)})</b>"
-        body = "\n\n".join(
+        summary.append(f"<b>Your matches ({len(matches)})</b>")
+        summary.append("\n\n".join(
             f"{kb.esc(p.school)} — {kb.esc(format_skills(p.skills_offered))}\n"
             f"<b>@{kb.esc(p.telegram_username)}</b>" if p.telegram_username else
             f"{kb.esc(p.school)} — contact unavailable"
             for p in matches
-        )
-        await send(update, f"{header}\n\n{body}")
-
+        ))
     if outgoing:
-        await send(
-            update,
+        summary.append(
             f"Waiting on {len(outgoing)} person{'s' if len(outgoing) > 1 else ''}. "
-            "You'll get a message when they answer.",
+            "You'll get a message when they answer."
         )
+    if incoming:
+        shown = min(len(incoming), MAX_REQUEST_CARDS_PER_RUN)
+        summary.append(f"<b>{len(incoming)} request{'s' if len(incoming) > 1 else ''} for you</b>")
+        if len(incoming) > shown:
+            summary.append(f"Showing the first {shown}. Answer these, then /matches for the rest.")
+    if summary:
+        await send(update, "\n\n".join(summary))
 
     if incoming:
         event_name = await event_name_for(context, event_code)
-        await send(update, f"<b>{len(incoming)} request{'s' if len(incoming) > 1 else ''} for you</b>")
-        for requester in incoming:
+        for requester in incoming[:MAX_REQUEST_CARDS_PER_RUN]:
             await send(
                 update,
                 kb.render_request_card(score(profile, requester), event_name),
@@ -1018,6 +1084,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await profile_command(update, context)
     elif action == "matches":
         await matches_command(update, context)
+    elif action == "myevents":
+        await myevents_command(update, context)
     elif action == "help":
         await help_command(update, context)
     elif action == "edit":
@@ -1094,6 +1162,7 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ------------------------------------------------------------- organiser flow
 
 
+@db_guard
 async def newevent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if not may_create_events(user_id):
@@ -1102,6 +1171,30 @@ async def newevent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "Creating hackathons is limited to organisers.\n\n"
             f"Ask whoever runs this bot to add your Telegram ID <code>{user_id}</code> "
             "to <code>ORGANISER_IDS</code>.",
+        )
+        return
+
+    now = time.monotonic()
+    recent = [t for t in context.user_data.get("event_creations", ()) if now - t < EVENT_RATE_WINDOW_SECONDS]
+    context.user_data["event_creations"] = recent
+    if len(recent) >= MAX_EVENTS_PER_HOUR_PER_ORGANISER:
+        wait_minutes = max(1, int((EVENT_RATE_WINDOW_SECONDS - (now - recent[0])) // 60))
+        await send(
+            update,
+            f"That's {len(recent)} hackathons in the last hour, which is the limit.\n\n"
+            f"Try again in about {wait_minutes} minute{'s' if wait_minutes > 1 else ''} — "
+            "/myevents shows the ones you already have.",
+        )
+        return
+
+    active = await run_db(db.count_active_events_for_organiser, user_id)
+    if active >= MAX_ACTIVE_EVENTS_PER_ORGANISER:
+        await send(
+            update,
+            f"You already have {active} active events, which is the limit.\n\n"
+            "Open /myevents and close an old event before creating another. "
+            "Closing keeps all of its matches and frees up a slot.",
+            reply_markup=kb.myevents_link_keyboard(),
         )
         return
 
@@ -1161,6 +1254,8 @@ async def create_event_from_announcement(update: Update, context: ContextTypes.D
     organiser_id = update.effective_user.id
     event_code, event_name = await run_db(db.create_event, name, announcement[:4000], organiser_id)
     link = deep_link(event_code)
+    context.user_data.setdefault("event_creations", []).append(time.monotonic())
+    STATS.record_action("event_created")
     logger.info("Organiser %s created event %s", organiser_id, event_code)
 
     # 1. The ready-to-post message — nothing else in it, so it pastes cleanly.
@@ -1183,13 +1278,82 @@ async def myevents_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not events:
         await send(update, "You haven't created any hackathons yet. Use /newevent to make one.")
         return
-    blocks = [
-        f"<b>{kb.esc(e['name'])}</b>\n"
-        f"{e['participants']} joined\n"
-        f"<code>{kb.esc(deep_link(e['event_code']))}</code>"
-        for e in events
-    ]
-    await send(update, "\n\n".join(blocks))
+    blocks = []
+    for e in events:
+        status = "Active" if e["is_active"] else "Closed"
+        block = (
+            f"<b>{kb.esc(e['name'])}</b> — {status}\n"
+            f"{e['participants']} joined"
+        )
+        if e["is_active"]:
+            block += f"\n<code>{kb.esc(deep_link(e['event_code']))}</code>"
+        blocks.append(block)
+    await send(update, "\n\n".join(blocks), reply_markup=kb.myevents_keyboard(events))
+
+
+@db_guard
+async def handle_event_close_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Step 1 of closing: ask the organiser to confirm."""
+    query = update.callback_query
+    event_code = query.data.split(":", 1)[1]
+    event = await run_db(db.get_event_row, event_code)
+
+    # Ownership is checked here for the message, and again in the database when the
+    # close actually happens — a forged button never gets as far as a write.
+    if event is None or event["organiser_telegram_id"] != update.effective_user.id:
+        await query.answer("That isn't one of your hackathons.", show_alert=True)
+        return
+    if not event["is_active"]:
+        await query.answer("That hackathon is already closed.", show_alert=True)
+        return
+
+    await query.answer()
+    await send(
+        update,
+        f"Close <b>{kb.esc(event['name'])}</b>?\n\n"
+        "New participants will no longer be able to join or find new teammates. "
+        "Existing matches will remain available.",
+        reply_markup=kb.confirm_close_keyboard(event_code),
+    )
+
+
+@db_guard
+async def handle_event_close_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Step 2 of closing: do it, re-checking ownership inside the transaction."""
+    query = update.callback_query
+
+    if query.data == "evcloseno":
+        await query.answer("Cancelled")
+        await safe_edit(query, "Cancelled — the hackathon is still open.")
+        return
+
+    event_code = query.data.split(":", 1)[1]
+    result = await run_db(db.close_event_as_organiser, event_code, update.effective_user.id)
+
+    if result == "closed":
+        name = await event_name_for(context, event_code)
+        STATS.record_action("event_closed")
+        logger.info("Organiser %s closed event %s", update.effective_user.id, event_code)
+        await query.answer("Closed")
+        await safe_edit(
+            query,
+            f"<b>{kb.esc(name)}</b> is closed.\n\n"
+            "Matchmaking has stopped. Everyone keeps the matches and usernames they "
+            "already have, and it no longer counts towards your open-hackathon limit.",
+        )
+        return
+    if result == "already_closed":
+        await query.answer("Already closed.", show_alert=True)
+        await safe_edit(query, "That hackathon is already closed.")
+        return
+
+    # 'not_owner' / 'not_found' — a stale or forged button. Say the same thing for both
+    # so nothing is revealed about events belonging to anyone else.
+    logger.warning(
+        "Rejected close of %s by user %s (%s)", event_code, update.effective_user.id, result
+    )
+    await query.answer("That isn't one of your hackathons.", show_alert=True)
+    await safe_edit(query, "That isn't one of your hackathons.")
 
 
 # ------------------------------------------------------------ free-text + errors
@@ -1256,10 +1420,43 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def post_shutdown(application: Application) -> None:
+    task = application.bot_data.pop("_heartbeat_task", None)
+    if task is not None:
+        task.cancel()
     db.close_pool()
 
 
+async def _heartbeat() -> None:
+    """One health line per minute to stdout, which is where Railway keeps logs.
+
+    Enough to tell during a hackathon whether MatchX is healthy: how much work it is
+    doing, how slow the database is, whether it is shedding load (pool timeouts) and
+    whether Telegram is throttling us.
+    """
+    while True:
+        try:
+            await asyncio.sleep(HEARTBEAT_SECONDS)
+            pool_stats = db._pool.get_stats() if db._pool is not None else None
+            logger.info("health | %s", STATS.format_heartbeat(pool_stats))
+        except asyncio.CancelledError:
+            raise
+        except Exception:                      # never let telemetry kill the bot
+            logger.debug("heartbeat failed", exc_info=True)
+
+
 async def post_init(application: Application) -> None:
+    # Replace Python's small default thread pool: run_db() dispatches every database
+    # call through it, so its size is the real ceiling on concurrent DB work.
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(
+        ThreadPoolExecutor(max_workers=DB_EXECUTOR_WORKERS, thread_name_prefix="db")
+    )
+    logger.info(
+        "DB concurrency: %s worker threads, pool max %s, pool timeout %ss",
+        DB_EXECUTOR_WORKERS, db.POOL_MAX_SIZE, db.POOL_TIMEOUT,
+    )
+    application.bot_data["_heartbeat_task"] = asyncio.create_task(_heartbeat())
+
     await application.bot.set_my_commands([
         BotCommand("start", "Open the menu / join a hackathon"),
         BotCommand("find", "Browse potential teammates"),
@@ -1310,6 +1507,9 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(handle_edit_field, pattern=r"^edit:"))
     application.add_handler(CallbackQueryHandler(handle_browse_action, pattern=r"^browse:"))
     application.add_handler(CallbackQueryHandler(handle_response, pattern=r"^resp:"))
+    # Registered before ^ev: — "evclose"/"evcloseyes" must not be captured by it.
+    application.add_handler(CallbackQueryHandler(handle_event_close_request, pattern=r"^evclose:"))
+    application.add_handler(CallbackQueryHandler(handle_event_close_confirm, pattern=r"^(evcloseyes:|evcloseno$)"))
     application.add_handler(CallbackQueryHandler(handle_event_switch, pattern=r"^ev:"))
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

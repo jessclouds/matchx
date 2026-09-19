@@ -63,7 +63,7 @@ def purge(event_code: str) -> None:
 
 
 def main_check() -> int:
-    print(f"{BOLD}Hackathon Match — self check{RESET}")
+    print(f"{BOLD}MatchX — self check{RESET}")
 
     step("0. Database")
     check("database reachable", db.ping())

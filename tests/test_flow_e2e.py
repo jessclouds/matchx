@@ -1193,3 +1193,225 @@ def test_note_survives_a_restart(world, application, event):
     alice2 = Session(restarted, ALICE, "alice")
     alice2.command("profile")
     assert NOTE in alice2.last.text
+
+
+# ------------------------------------------------- organiser closes an event
+
+def _make_event(world, name_suffix: str, organiser: int = ORGANISER) -> str:
+    code, _ = db.create_event(f"E2E Hack {name_suffix}{uuid.uuid4().hex[:4]}", "ann", organiser)
+    world._created_events.append(code)
+    return code
+
+
+def test_organiser_can_close_their_own_active_event(world):
+    code = _make_event(world, "close")
+    organiser = Session(world, ORGANISER, "organiser")
+    organiser.command("myevents")
+    assert "Active" in organiser.last.text
+    assert organiser.has_button("Close")
+
+    organiser.tap_data(f"evclose:{code}")
+    assert "Close" in organiser.last.text and "Existing matches will remain available" in organiser.last.text
+
+    organiser.tap_data(f"evcloseyes:{code}")
+    assert db.get_event_row(code)["is_active"] is False
+
+    organiser.clear()
+    organiser.command("myevents")
+    assert "Closed" in organiser.last.text
+
+
+def test_cancelling_the_confirmation_leaves_the_event_active(world):
+    code = _make_event(world, "cancel")
+    organiser = Session(world, ORGANISER, "organiser")
+    organiser.tap_data(f"evclose:{code}")
+    organiser.tap_data("evcloseno")
+    assert db.get_event_row(code)["is_active"] is True
+
+
+def test_forged_callback_cannot_close_another_organisers_event(world):
+    code = _make_event(world, "owned")
+    intruder = Session(world, ALICE, "alice")        # not the organiser
+    intruder.tap_data(f"evclose:{code}")
+    intruder.tap_data(f"evcloseyes:{code}")          # skip the confirmation entirely
+    assert db.get_event_row(code)["is_active"] is True, "a forged button must not close it"
+    assert db.close_event_as_organiser(code, ALICE) == "not_owner"
+
+
+def test_closed_event_frees_a_slot_under_the_active_cap(world):
+    code = _make_event(world, "cap")
+    before = db.count_active_events_for_organiser(ORGANISER)
+    assert db.close_event_as_organiser(code, ORGANISER) == "closed"
+    assert db.count_active_events_for_organiser(ORGANISER) == before - 1
+    assert db.close_event_as_organiser(code, ORGANISER) == "already_closed"
+
+
+def test_organiser_can_create_a_replacement_after_closing(world):
+    code = _make_event(world, "replace")
+    assert db.close_event_as_organiser(code, ORGANISER) == "closed"
+    organiser = Session(world, ORGANISER, "organiser")
+    organiser.command("newevent")
+    organiser.say("Replacement Hack")
+    organiser.clear()
+    organiser.say("Replacement Hack\nafter closing")
+    new_code = _event_code_from(organiser.inbox[0].text)
+    world._created_events.append(new_code)
+    assert db.get_event_row(new_code)["is_active"] is True
+
+
+def test_new_participant_cannot_join_a_closed_event(world):
+    code = _make_event(world, "nojoin")
+    db.close_event_as_organiser(code, ORGANISER)
+    newcomer = Session(world, CAROL, "carol")
+    newcomer.command("start", code)
+    assert "closed" in newcomer.all_text().lower()
+    assert db.get_profile(CAROL, code) is None
+
+
+def test_existing_participant_keeps_closed_event_and_matches(world):
+    code = _make_event(world, "keep")
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, code, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, code, offers=("UI / UX",), needs=("Software",))
+
+    alice.clear()
+    alice.command("find")
+    alice.tap("Request Match")
+    bob.tap("Accept")          # the request card is already in Bob's inbox
+    assert "@alice" in bob.all_text()
+
+    db.close_event_as_organiser(code, ORGANISER)
+
+    # still listed, labelled closed
+    alice.clear()
+    alice.command("events")
+    listed = [e["event_code"] for e in db.list_profiles_for_user(ALICE)]
+    assert code in listed
+    assert any(not e["is_active"] for e in db.list_profiles_for_user(ALICE) if e["event_code"] == code)
+
+    # historical match and revealed username survive
+    alice.clear()
+    alice.command("matches")
+    assert "@bob" in alice.all_text()
+    assert len(db.get_matches(ALICE, code)) == 1
+
+
+def test_find_is_refused_once_the_event_is_closed(world):
+    code = _make_event(world, "nofind")
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, code, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, code, offers=("UI / UX",), needs=("Software",))
+    db.close_event_as_organiser(code, ORGANISER)
+
+    alice.clear()
+    alice.command("find")
+    assert "Potential teammate" not in alice.last.text
+    assert "closed" in alice.all_text().lower()
+
+
+def test_new_request_is_refused_once_the_event_is_closed(world):
+    code = _make_event(world, "noreq")
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, code, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, code, offers=("UI / UX",), needs=("Software",))
+    db.close_event_as_organiser(code, ORGANISER)
+
+    assert db.request_match(code, ALICE, BOB) == "closed"
+    assert db.respond_to_request(code, ALICE, BOB, True) == "closed"
+    assert db.get_matches(ALICE, code) == []
+
+
+def test_closing_one_event_does_not_affect_another(world):
+    first = _make_event(world, "one")
+    second = _make_event(world, "two")
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, second, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, second, offers=("UI / UX",), needs=("Software",))
+
+    db.close_event_as_organiser(first, ORGANISER)
+
+    assert db.get_event_row(second)["is_active"] is True
+    alice.clear()
+    alice.command("find")
+    assert "Potential teammate" in alice.last.text
+    assert db.request_match(second, ALICE, BOB) in ("requested", "matched")
+
+
+def test_active_event_cap_blocks_then_recovers_via_myevents(world):
+    """The full organiser recovery journey: hit the cap, be told what to do, do it, continue.
+
+    Uses a dedicated organiser id so it cannot be perturbed by other tests' events.
+    """
+    capper = 910_000_008
+    codes = [
+        _make_event(world, f"cap{i}", organiser=capper)
+        for i in range(main.MAX_ACTIVE_EVENTS_PER_ORGANISER)
+    ]
+    assert db.count_active_events_for_organiser(capper) == main.MAX_ACTIVE_EVENTS_PER_ORGANISER
+
+    organiser = Session(world, capper, "capper")
+
+    # 2 + 3. /newevent is blocked, and the message teaches the way out.
+    organiser.command("newevent")
+    blocked = organiser.last.text
+    assert "/myevents" in blocked, f"must name /myevents, got: {blocked}"
+    assert "close" in blocked.lower()
+    assert organiser.has_button("View My Events")
+    assert organiser.last.reply_markup is not None
+
+    # 4. the button reaches the event list, which shows them as Active.
+    organiser.tap("View My Events")
+    listing = organiser.last.text
+    assert "Active" in listing
+
+    # 5. close one, with confirmation.
+    organiser.tap_data(f"evclose:{codes[0]}")
+    assert "Existing matches will remain available" in organiser.last.text
+    organiser.tap_data(f"evcloseyes:{codes[0]}")
+    assert db.get_event_row(codes[0])["is_active"] is False
+
+    # 6. the closed one no longer counts.
+    assert db.count_active_events_for_organiser(capper) == main.MAX_ACTIVE_EVENTS_PER_ORGANISER - 1
+
+    # 7. /newevent works again straight away — no cooldown.
+    organiser.clear()
+    organiser.command("newevent")
+    assert "limit" not in organiser.last.text.lower()
+    organiser.say("Recovered Hack")
+    organiser.clear()
+    organiser.say("Recovered Hack\nafter closing one")
+    new_code = _event_code_from(organiser.inbox[0].text)
+    world._created_events.append(new_code)
+    assert db.get_event_row(new_code)["is_active"] is True
+
+
+def test_hourly_creation_limit_still_applies(world):
+    """5 creations/hour stays enforced, and is separate from the active-event cap."""
+    limiter = 910_000_007
+    organiser = Session(world, limiter, "limiter")
+    for i in range(main.MAX_EVENTS_PER_HOUR_PER_ORGANISER):
+        organiser.clear()
+        organiser.command("newevent")
+        organiser.say(f"Hourly {i}")
+        organiser.clear()
+        organiser.say(f"Hourly {i}\nannouncement")
+        world._created_events.append(_event_code_from(organiser.inbox[0].text))
+
+    organiser.clear()
+    organiser.command("newevent")
+    assert "last hour" in organiser.last.text.lower()
+
+
+def test_participants_have_no_cap_on_hackathons_joined(world):
+    """Participants stay unrestricted — the caps are organiser-side only."""
+    joined = []
+    for i in range(6):
+        code = _make_event(world, f"many{i}")
+        onboard(Session(world, ALICE, "alice"), code, offers=("Software",), needs=("UI / UX",))
+        joined.append(code)
+    rows = {r["event_code"] for r in db.list_profiles_for_user(ALICE)}
+    assert set(joined).issubset(rows), "a participant must be able to join any number of events"

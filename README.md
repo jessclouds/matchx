@@ -1,4 +1,4 @@
-# Hackathon Match (MatchX)
+# MatchX
 
 A Telegram bot that pairs hackathon participants with the teammates they actually
 need. Organisers create an event and share one link; participants answer six taps,

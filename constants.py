@@ -85,14 +85,14 @@ NEED_QUESTION: Final[dict[str, str]] = {
 }
 
 NO_USERNAME_MESSAGE: Final[str] = (
-    "You need a Telegram username before you can use Hackathon Match.\n\n"
+    "You need a Telegram username before you can use MatchX.\n\n"
     "Your @username is the only way a teammate can reach you after you both say yes.\n\n"
     "To set one: Telegram → Settings → tap your name → Username.\n\n"
     "Then send /start here again."
 )
 
 HELP_TEXT: Final[str] = (
-    "Hackathon Match helps you find teammates at your hackathon.\n\n"
+    "MatchX helps you find teammates at your hackathon.\n\n"
     "<b>How it works</b>\n"
     "1. Join with your hackathon's link\n"
     "2. Answer six quick questions\n"

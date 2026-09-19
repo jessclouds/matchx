@@ -165,8 +165,37 @@ def no_candidates_keyboard(has_skips: bool, can_go_back: bool = False) -> Inline
 
 
 def event_picker_keyboard(events: list[dict]) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(e["name"], callback_data=f"ev:{e['event_code']}")] for e in events[:10]]
+    rows = [
+        [InlineKeyboardButton(
+            e["name"] if e.get("is_active", True) else f"{e['name']} (closed)",
+            callback_data=f"ev:{e['event_code']}",
+        )]
+        for e in events[:10]
+    ]
     return InlineKeyboardMarkup(rows)
+
+
+def myevents_keyboard(events: list[dict]) -> InlineKeyboardMarkup | None:
+    """A Close button per still-open event, so organisers do not need the CLI."""
+    rows = [
+        [InlineKeyboardButton(f"Close {e['name']}", callback_data=f"evclose:{e['event_code']}")]
+        for e in events[:10] if e.get("is_active", True)
+    ]
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def myevents_link_keyboard() -> InlineKeyboardMarkup:
+    """Shown when an organiser is at the active-event cap, so the way out is one tap."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("View My Events", callback_data="menu:myevents")]]
+    )
+
+
+def confirm_close_keyboard(event_code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Confirm Close", callback_data=f"evcloseyes:{event_code}")],
+        [InlineKeyboardButton("Cancel", callback_data="evcloseno")],
+    ])
 
 
 # ------------------------------------------------------------------- rendering
