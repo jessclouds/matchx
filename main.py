@@ -118,6 +118,32 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, re
     return False
 
 
+async def ack(query, text: str | None = None, show_alert: bool = False) -> None:
+    """Answer a callback query, at most once.
+
+    Telegram leaves the tapped button showing a spinner until its callback query is
+    answered, so a handler that queries the database first leaves the button looking
+    stuck for a whole round trip — about 70ms from Railway to Supabase in Tokyo, and
+    far more from a laptop. Answering first makes the tap feel instant; the work then
+    happens behind an already-responsive button.
+
+    A query can only be answered once, so later calls are dropped rather than raising.
+    Every path that used to report its outcome in that second answer also edits the
+    message it belongs to, which is where the outcome is actually read.
+    """
+    if getattr(query, "_matchx_answered", False):
+        return
+    try:
+        query._matchx_answered = True
+    except AttributeError:                    # pragma: no cover - defensive
+        pass
+    try:
+        await query.answer(text, show_alert=show_alert)
+    except TelegramError as exc:
+        # A query expires after about a minute; nothing to do but carry on.
+        logger.debug("Could not answer callback query: %s", exc)
+
+
 def username_of(update: Update) -> str | None:
     user = update.effective_user
     return user.username if user else None
@@ -376,7 +402,7 @@ async def ask_school(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def handle_school_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await ack(query)
     school = query.data.split("_", 1)[1]
     draft(context)["school"] = school
     await safe_edit(query, f"School: {kb.esc(school)}")
@@ -393,7 +419,7 @@ async def ask_school_preference(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def handle_preference_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await ack(query)
     preference = query.data.split("_", 1)[1]
     draft(context)["school_preference"] = preference
     label = dict(SCHOOL_PREFERENCES).get(preference, preference)
@@ -411,7 +437,7 @@ async def ask_discipline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_discipline_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await ack(query)
     discipline = query.data.split("_", 1)[1]
     draft(context)["discipline"] = discipline
     label = dict(DISCIPLINES).get(discipline, discipline)
@@ -425,7 +451,7 @@ async def ask_team_status(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def handle_team_status_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await ack(query)
     team_status = query.data.split("_", 1)[1]
     draft(context)["team_status"] = team_status
     label = dict(STATUSES).get(team_status, team_status)
@@ -464,23 +490,23 @@ async def handle_skill_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if value == "any":
         if prefix == "offer":                          # defensive: no wildcard on the offer step
-            await query.answer()
+            await ack(query)
             return
         data[key] = set()
         data["open_to_any"] = True
-        await query.answer("Open to anyone")
+        await ack(query, "Open to anyone")
         await safe_edit(query, "Looking for: anyone — no preference")
         await advance(update, context, "need")
         return
 
     if value == "done":
         if prefix == "offer" and not selected:
-            await query.answer("Pick at least one skill you can bring.", show_alert=True)
+            await ack(query, "Pick at least one skill you can bring.", show_alert=True)
             return
         if prefix == "need":
             data["open_to_any"] = not selected
         data[key] = selected
-        await query.answer()
+        await ack(query)
         label = "You offer" if prefix == "offer" else "Looking for"
         empty = "anyone — no preference"
         await safe_edit(query, f"{label}: {kb.esc(format_skills(selected, empty))}")
@@ -490,13 +516,13 @@ async def handle_skill_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
     if value in selected:
         selected.discard(value)
     elif len(selected) >= MAX_SKILLS:
-        await query.answer(f"You can pick at most {MAX_SKILLS}. Tap one to remove it first.", show_alert=True)
+        await ack(query, f"You can pick at most {MAX_SKILLS}. Tap one to remove it first.", show_alert=True)
         return
     else:
         selected.add(value)
 
     data[key] = selected
-    await query.answer()
+    await ack(query)
     await safe_edit(query, reply_markup=kb.build_skill_keyboard(prefix, selected, show_wildcard=(prefix == "need")))
 
 
@@ -520,7 +546,7 @@ async def ask_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def handle_note_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await ack(query)
     choice = query.data.split(":", 1)[1]
 
     if choice == "add":
@@ -812,26 +838,38 @@ async def handle_browse_action(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     parts = query.data.split(":")
     action = parts[1]
+    user_id = update.effective_user.id
 
-    if _too_many(update.effective_user.id, _MAX_ACTIONS_PER_WINDOW):
-        await query.answer("Slow down a moment — try again shortly.", show_alert=True)
+    # Both guards are in-memory, so they run before the callback is answered and can
+    # still deliver their alert. The request limit is checked here rather than inside
+    # handle_request because _too_many() records the attempt — calling it in both
+    # places would count every request twice.
+    if _too_many(user_id, _MAX_ACTIONS_PER_WINDOW):
+        await ack(query, "Slow down a moment — try again shortly.", show_alert=True)
         return
+    if action == "req" and _too_many(user_id, _MAX_REQUESTS_PER_WINDOW):
+        await ack(query, "That's a lot of requests at once — try again in a minute.", show_alert=True)
+        return
+
+    # Answer now: everything below needs the database, and the button should not sit
+    # spinning for it.
+    await ack(query)
 
     profile = await current_profile(update, context)
     if not profile:
-        await query.answer()
+        await ack(query)
         await no_profile_prompt(update)
         return
 
     if action == "reset":
-        await query.answer()
+        await ack(query)
         cleared = await run_db(db.clear_skips, profile.telegram_user_id, profile.event_code)
         await safe_edit(query, f"Brought back {cleared} skipped teammate{'s' if cleared != 1 else ''}.")
         await find_matches(update, context)
         return
 
     if action == "back":
-        await query.answer()
+        await ack(query)
         # Leave the card being stepped away from in place, but without live buttons.
         await safe_edit(query, reply_markup=None)
         if not await show_previous_candidate(update, context, profile):
@@ -845,17 +883,17 @@ async def handle_browse_action(update: Update, context: ContextTypes.DEFAULT_TYP
         # Older button, or a plain "next" with nothing to skip.
         candidate_id = _current_candidate_id(context, profile.event_code) if action == "next" else None
         if candidate_id is None:
-            await query.answer()
+            await ack(query)
             await find_matches(update, context)
             return
 
     if candidate_id == profile.telegram_user_id:
-        await query.answer()
+        await ack(query)
         await find_matches(update, context)
         return
 
     if action in ("next", "skip"):
-        await query.answer()
+        await ack(query)
         await run_db(db.record_skip, profile.telegram_user_id, profile.event_code, candidate_id)
         await safe_edit(query, "Seen.")
         await find_matches(update, context)
@@ -872,13 +910,10 @@ async def handle_request(
     candidate_id: int,
 ) -> None:
     """Request Match: push my card to the recipient so they can answer."""
-    query = update.callback_query
-    if _too_many(me.telegram_user_id, _MAX_REQUESTS_PER_WINDOW):
-        await query.answer("That's a lot of requests at once — try again in a minute.", show_alert=True)
-        return
+    query = update.callback_query        # already answered, and rate-limited, by the caller
     other = await run_db(db.get_profile, candidate_id, me.event_code)
     if not other:
-        await query.answer("That teammate is no longer available.", show_alert=True)
+        await ack(query, "That teammate is no longer available.", show_alert=True)
         await find_matches(update, context)
         return
 
@@ -886,7 +921,7 @@ async def handle_request(
     event_name = await event_name_for(context, me.event_code)
 
     if result == "matched":
-        await query.answer("It's a match")
+        await ack(query, "It's a match")
         await safe_edit(query, kb.render_match(other), reply_markup=kb.home_keyboard())
         fresh_me = await run_db(db.get_profile, me.telegram_user_id, me.event_code) or me
         await notify(context, candidate_id, kb.render_match(fresh_me), reply_markup=kb.home_keyboard())
@@ -894,18 +929,18 @@ async def handle_request(
         return
 
     if result == "already_matched":
-        await query.answer("You're already matched with them.")
+        await ack(query, "You're already matched with them.")
         await safe_edit(query, kb.render_match(other), reply_markup=kb.home_keyboard())
         return
 
     if result == "already_pending":
-        await query.answer("Already sent — waiting on their answer.", show_alert=True)
+        await ack(query, "Already sent — waiting on their answer.", show_alert=True)
         await safe_edit(query, "Request already sent — waiting for their answer.")
         await find_matches(update, context)
         return
 
     if result == "closed":
-        await query.answer("This hackathon has closed.", show_alert=True)
+        await ack(query, "This hackathon has closed.", show_alert=True)
         await safe_edit(
             query,
             f"<b>{kb.esc(event_name)}</b> has closed, so no new requests can be sent. "
@@ -915,12 +950,12 @@ async def handle_request(
         return
 
     if result == "invalid":
-        await query.answer()
+        await ack(query)
         await find_matches(update, context)
         return
 
     # 'requested' — deliver my card to them so they never have to find me by chance.
-    await query.answer("Request sent")
+    await ack(query, "Request sent")
     await safe_edit(query, "Request sent. I'll tell you when they answer.")
 
     my_card = score(other, me)   # scored from the recipient's point of view
@@ -946,9 +981,12 @@ async def handle_response(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         requester_id = int(parts[2])
     except (IndexError, ValueError):
-        await query.answer("That button is no longer valid.", show_alert=True)
+        await ack(query, "That button is no longer valid.", show_alert=True)
         return
     accept = parts[1] == "yes"
+
+    # Parsing is done; the rest is database work, so release the button now.
+    await ack(query)
 
     me_id = update.effective_user.id
     event_code = (
@@ -956,7 +994,7 @@ async def handle_response(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         or context.user_data.get("event_code")
     )
     if not event_code:
-        await query.answer("That request is no longer open.", show_alert=True)
+        await ack(query, "That request is no longer open.", show_alert=True)
         await safe_edit(query, "This request is no longer open.", reply_markup=kb.home_keyboard())
         return
 
@@ -964,7 +1002,7 @@ async def handle_response(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     result = await run_db(db.respond_to_request, event_code, requester_id, me_id, accept)
 
     if result == "closed":
-        await query.answer("This hackathon has closed.", show_alert=True)
+        await ack(query, "This hackathon has closed.", show_alert=True)
         await safe_edit(
             query,
             "This hackathon has closed, so new matches can't be made. "
@@ -974,20 +1012,20 @@ async def handle_response(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if result in ("not_found", "already_declined"):
-        await query.answer("That request is no longer open.", show_alert=True)
+        await ack(query, "That request is no longer open.", show_alert=True)
         await safe_edit(query, "This request is no longer open.", reply_markup=kb.home_keyboard())
         return
 
     requester = await run_db(db.get_profile, requester_id, event_code)
 
     if result == "already_matched":
-        await query.answer("You're already matched")
+        await ack(query, "You're already matched")
         if requester:
             await safe_edit(query, kb.render_match(requester), reply_markup=kb.home_keyboard())
         return
 
     if result == "declined":
-        await query.answer("Declined")
+        await ack(query, "Declined")
         await safe_edit(
             query,
             "Declined. They won't be told who said no.",
@@ -997,7 +1035,7 @@ async def handle_response(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # result == 'matched' — notify exactly once, on this transition only.
     me = await run_db(db.get_profile, me_id, event_code)
-    await query.answer("It's a match")
+    await ack(query, "It's a match")
     if requester:
         await safe_edit(query, kb.render_match(requester), reply_markup=kb.home_keyboard())
     if me:
@@ -1074,7 +1112,7 @@ async def matches_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     action = query.data.split(":", 1)[1]
-    await query.answer()
+    await ack(query)
 
     if action == "home":
         await show_menu(update, context)
@@ -1112,7 +1150,7 @@ async def handle_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Edit one field: ask that question, then save and return to the profile."""
     query = update.callback_query
     field = query.data.split(":", 1)[1]
-    await query.answer()
+    await ack(query)
 
     profile = await current_profile(update, context)
     if not profile:
@@ -1138,7 +1176,7 @@ async def handle_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 @db_guard
 async def handle_event_switch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await ack(query)
     event_code = query.data.split(":", 1)[1]
     context.user_data["event_code"] = event_code
     await show_menu(update, context)
@@ -1369,13 +1407,13 @@ async def handle_event_close_request(update: Update, context: ContextTypes.DEFAU
     # Ownership is checked here for the message, and again in the database when the
     # close actually happens — a forged button never gets as far as a write.
     if event is None or event["organiser_telegram_id"] != update.effective_user.id:
-        await query.answer("That isn't one of your hackathons.", show_alert=True)
+        await ack(query, "That isn't one of your hackathons.", show_alert=True)
         return
     if not event["is_active"]:
-        await query.answer("That hackathon is already closed.", show_alert=True)
+        await ack(query, "That hackathon is already closed.", show_alert=True)
         return
 
-    await query.answer()
+    await ack(query)
     await send(
         update,
         f"Close <b>{kb.esc(event['name'])}</b>?\n\n"
@@ -1391,7 +1429,7 @@ async def handle_event_close_confirm(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
 
     if query.data == "evcloseno":
-        await query.answer("Cancelled")
+        await ack(query, "Cancelled")
         await safe_edit(query, "Cancelled — the hackathon is still open.")
         return
 
@@ -1402,7 +1440,7 @@ async def handle_event_close_confirm(update: Update, context: ContextTypes.DEFAU
         name = await event_name_for(context, event_code)
         STATS.record_action("event_closed")
         logger.info("Organiser %s closed event %s", update.effective_user.id, event_code)
-        await query.answer("Closed")
+        await ack(query, "Closed")
         await safe_edit(
             query,
             f"<b>{kb.esc(name)}</b> is closed.\n\n"
@@ -1411,7 +1449,7 @@ async def handle_event_close_confirm(update: Update, context: ContextTypes.DEFAU
         )
         return
     if result == "already_closed":
-        await query.answer("Already closed.", show_alert=True)
+        await ack(query, "Already closed.", show_alert=True)
         await safe_edit(query, "That hackathon is already closed.")
         return
 
@@ -1420,7 +1458,7 @@ async def handle_event_close_confirm(update: Update, context: ContextTypes.DEFAU
     logger.warning(
         "Rejected close of %s by user %s (%s)", event_code, update.effective_user.id, result
     )
-    await query.answer("That isn't one of your hackathons.", show_alert=True)
+    await ack(query, "That isn't one of your hackathons.", show_alert=True)
     await safe_edit(query, "That isn't one of your hackathons.")
 
 

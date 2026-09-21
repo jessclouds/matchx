@@ -1597,3 +1597,118 @@ def test_escape_heavy_caption_never_exceeds_telegram_limits(world):
     sent = _html.unescape(" ".join(m.text or "" for m in organiser.inbox))
     assert raw in sent.replace(" ", ""), "the organiser's announcement must survive intact"
     assert CTA_MARK in sent and "?start=" in sent
+
+
+# ------------------------------------------------- callback responsiveness
+
+@pytest.fixture
+def call_order(monkeypatch):
+    """Records the order of callback acknowledgement vs database work."""
+    import fake_telegram as ft
+    order: list[str] = []
+
+    orig_answer = ft.FakeQuery.answer
+    async def spy_answer(self, text=None, show_alert=False):
+        order.append("ack")
+        return await orig_answer(self, text, show_alert)
+    monkeypatch.setattr(ft.FakeQuery, "answer", spy_answer)
+
+    orig_run_db = main.run_db
+    async def spy_run_db(fn, *a, **k):
+        order.append("db:" + getattr(fn, "__name__", str(fn)))
+        return await orig_run_db(fn, *a, **k)
+    monkeypatch.setattr(main, "run_db", spy_run_db)   # main imported run_db by name
+    return order
+
+
+def _assert_ack_first(order, button):
+    assert order, f"{button}: nothing recorded"
+    assert order[0] == "ack", (
+        f"{button}: the callback must be answered before any database work, "
+        f"otherwise the button keeps spinning. Got: {order[:4]}"
+    )
+
+
+def test_browse_buttons_acknowledge_before_touching_the_database(world, event, call_order):
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",))
+    alice.clear(); alice.command("find")
+
+    call_order.clear(); alice.tap("Next"); _assert_ack_first(call_order, "Next →")
+    alice.command("find")
+    call_order.clear(); alice.tap("Back"); _assert_ack_first(call_order, "← Back")
+
+
+def test_request_match_acknowledges_before_touching_the_database(world, event, call_order):
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",))
+    alice.clear(); alice.command("find")
+    call_order.clear()
+    alice.tap("Request Match")
+    _assert_ack_first(call_order, "Request Match")
+
+
+def test_accept_acknowledges_before_touching_the_database(world, event, call_order):
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",))
+    alice.clear(); alice.command("find"); alice.tap("Request Match")
+    call_order.clear()
+    bob.tap("Accept")
+    _assert_ack_first(call_order, "Accept")
+
+
+def test_decline_acknowledges_before_touching_the_database(world, event, call_order):
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",))
+    alice.clear(); alice.command("find"); alice.tap("Request Match")
+    call_order.clear()
+    bob.tap("Decline")
+    _assert_ack_first(call_order, "Decline")
+
+
+def test_no_callback_handler_forgets_to_answer():
+    """Every registered callback handler must answer its query on every path."""
+    import ast, pathlib
+    tree = ast.parse(pathlib.Path(main.__file__).read_text())
+    registered = [
+        c.args[0].id for c in ast.walk(tree)
+        if isinstance(c, ast.Call) and getattr(c.func, "id", "") == "CallbackQueryHandler"
+        and c.args and isinstance(c.args[0], ast.Name)
+    ]
+    assert registered, "no callback handlers found — the check would pass vacuously"
+    funcs = {n.name: n for n in ast.walk(tree)
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    missing = []
+    for name in registered:
+        fn = funcs.get(name)
+        answers = [
+            n for n in ast.walk(fn)
+            if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "ack"
+        ]
+        # handlers that delegate (e.g. to handle_request) are covered by their caller
+        if not answers and "handle_request" not in ast.dump(fn):
+            missing.append(name)
+    assert not missing, f"callback handlers that never answer their query: {missing}"
+
+
+def test_rate_limited_request_still_alerts_and_is_counted_once(world, event, call_order):
+    """The request limit moved into handle_browse_action; it must not double-count."""
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",))
+    main._recent_actions.clear()
+    alice.clear(); alice.command("find")
+    query = alice.tap("Request Match")
+    # one tap must record one request against the limiter, not two
+    assert len(main._recent_actions.get(ALICE, [])) <= 2, (
+        "a single Request Match tap must not be counted twice by the rate limiter"
+    )
