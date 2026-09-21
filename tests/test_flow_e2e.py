@@ -20,9 +20,11 @@ pytestmark = pytest.mark.skipif(
 import db  # noqa: E402
 import main  # noqa: E402
 import keyboards as kb  # noqa: E402
+import fake_telegram as ft  # noqa: E402
 from fake_telegram import Session, World  # noqa: E402
 
 ALICE, BOB, CAROL, DAVE, ORGANISER = (910_000_001, 910_000_002, 910_000_003, 910_000_004, 910_000_009)
+DAVE2 = 910_000_005
 
 
 def _purge_event(code: str) -> None:
@@ -1712,3 +1714,112 @@ def test_rate_limited_request_still_alerts_and_is_counted_once(world, event, cal
     assert len(main._recent_actions.get(ALICE, [])) <= 2, (
         "a single Request Match tap must not be counted twice by the rate limiter"
     )
+
+
+# ------------------------- rapid interaction safety after early acknowledgement
+
+def test_rapid_double_request_creates_one_interest(world, event):
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",))
+    alice.clear(); alice.command("find")
+    msg, button = alice.find_button("Request Match")
+    alice.tap_data(button.callback_data, msg)
+    alice.tap_data(button.callback_data, msg)      # same button, replayed
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM interests WHERE event_code=%s AND from_user_id=%s AND to_user_id=%s",
+            (event, ALICE, BOB))
+        assert cur.fetchone()["n"] == 1, "a replayed Request must not create a second interest"
+
+
+def test_rapid_double_accept_creates_one_match(world, event):
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",))
+    alice.clear(); alice.command("find"); alice.tap("Request Match")
+    msg, button = bob.find_button("Accept")
+    bob.tap_data(button.callback_data, msg)
+    bob.tap_data(button.callback_data, msg)        # replayed accept
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM matches WHERE event_code=%s", (event,))
+        assert cur.fetchone()["n"] == 1, "a replayed Accept must not create a second match"
+    assert len(db.get_matches(ALICE, event)) == 1
+
+
+def test_accept_then_decline_keeps_the_match(world, event):
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",))
+    alice.clear(); alice.command("find"); alice.tap("Request Match")
+    msg, _ = bob.find_button("Accept")
+    accept = next(b for b in msg.buttons() if "Accept" in b.text)
+    decline = next(b for b in msg.buttons() if "Decline" in b.text)
+    bob.tap_data(accept.callback_data, msg)
+    bob.tap_data(decline.callback_data, msg)       # racing decline after the match
+    assert len(db.get_matches(ALICE, event)) == 1, "a late Decline must not undo a match"
+
+
+def test_rapid_next_taps_do_not_lose_or_repeat_candidates(world, event):
+    alice = Session(world, ALICE, "alice")
+    for uid, name in ((BOB, "bob"), (CAROL, "carol"), (DAVE2, "dave2")):
+        onboard(Session(world, uid, name), event, offers=("UI / UX",), needs=("Software",))
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    alice.clear(); alice.command("find")
+    seen = []
+    for _ in range(8):
+        if not alice.has_button("Next"):
+            break
+        msg, button = alice.find_button("Next")
+        seen.append(button.callback_data)
+        alice.tap_data(button.callback_data, msg)
+    # every skip recorded exactly once, nobody shown twice
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT to_user_id, count(*) AS n FROM interests "
+            "WHERE event_code=%s AND from_user_id=%s AND status='skipped' GROUP BY to_user_id",
+            (event, ALICE))
+        rows = cur.fetchall()
+    assert all(r["n"] == 1 for r in rows), f"duplicate skip rows: {rows}"
+
+
+def test_reciprocal_requests_still_match_exactly_once(world, event):
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",))
+    assert db.request_match(event, ALICE, BOB) == "requested"
+    assert db.request_match(event, BOB, ALICE) == "matched"
+    with db.get_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM matches WHERE event_code=%s", (event,))
+        assert cur.fetchone()["n"] == 1
+
+
+def test_requester_sees_their_next_card_before_the_recipient_is_notified(world, event):
+    """The tapping user's screen must not wait on someone else's Telegram call."""
+    alice = Session(world, ALICE, "alice")
+    bob = Session(world, BOB, "bob")
+    carol = Session(world, CAROL, "carol")
+    onboard(alice, event, offers=("Software",), needs=("UI / UX",))
+    onboard(bob, event, offers=("UI / UX",), needs=("Software",))
+    onboard(carol, event, offers=("UI / UX",), needs=("Software",))
+    alice.clear(); bob.clear()
+    alice.command("find")
+    order: list[str] = []
+    orig = ft.FakeChat.send_message
+    async def spy(self, text, reply_markup=None, parse_mode=None):
+        order.append("alice" if self.id == ALICE else f"other:{self.id}")
+        return await orig(self, text, reply_markup, parse_mode)
+    ft.FakeChat.send_message = spy
+    try:
+        alice.tap("Request Match")
+    finally:
+        ft.FakeChat.send_message = orig
+    assert "alice" in order, f"the requester saw nothing: {order}"
+    others = [i for i, x in enumerate(order) if x.startswith("other")]
+    first_alice = order.index("alice")
+    assert not others or first_alice < others[0], (
+        f"the requester's own screen must update before the recipient's message: {order}")

@@ -514,6 +514,19 @@ _CANDIDATE_SQL = f"""
 """
 
 
+def _candidate_params(me: Profile, limit: int) -> dict[str, Any]:
+    return {
+        "event": me.event_code,
+        "me": me.telegram_user_id,
+        "needs": list(me.needs),
+        "my_offers": list(me.offers),
+        "all_skills": sorted(ALL_SKILL_VALUES),
+        "pref": (me.school_preference or "none").lower(),
+        "school": me.school,
+        "limit": limit,
+    }
+
+
 def find_candidates(me: Profile, limit: int = 25) -> list[Profile]:
     """Eligible candidates for `me`, best page first.
 
@@ -576,6 +589,58 @@ def count_interactions(event_code: str, telegram_user_id: int) -> int:
             (event_code, telegram_user_id),
         )
         return cur.fetchone()["n"]
+
+    return _run(q)
+
+
+def empty_state_info(event_code: str, telegram_user_id: int) -> dict[str, Any]:
+    """Everything the "no candidates" screen needs, in one round trip.
+
+    Returns the event's name and open/closed state alongside the three counts that
+    choose the wording. These used to be two sequential queries, and this is the
+    screen most people land on late in a hackathon.
+    """
+
+    def q(cur: psycopg.Cursor) -> dict[str, Any]:
+        cur.execute(
+            """
+            SELECT e.name, e.is_active,
+                (SELECT count(*) FROM interests
+                  WHERE event_code = %(event)s AND from_user_id = %(me)s
+                    AND status = 'skipped')                        AS skipped,
+                (SELECT count(*) FROM interests
+                  WHERE event_code = %(event)s AND from_user_id = %(me)s) AS interactions,
+                (SELECT count(*) FROM profiles
+                  WHERE event_code = %(event)s AND is_active
+                    AND telegram_user_id <> %(me)s)                AS others
+            FROM events e WHERE e.event_code = %(event)s
+            """,
+            {"event": event_code, "me": telegram_user_id},
+        )
+        return cur.fetchone() or {}
+
+    return _run(q)
+
+
+def skip_and_find_candidates(me: Profile, other_user_id: int, limit: int = 25) -> list[Profile]:
+    """Record a skip and fetch the next page in the same round trip.
+
+    Next is the most-tapped button in the whole bot, and the skip must land before the
+    page is read or the same person can come back round. Doing both in one transaction
+    keeps that guarantee and halves the wait.
+    """
+    def q(cur: psycopg.Cursor) -> list[Profile]:
+        if me.telegram_user_id != other_user_id:
+            cur.execute(
+                """
+                INSERT INTO interests (event_code, from_user_id, to_user_id, status)
+                VALUES (%s, %s, %s, 'skipped')
+                ON CONFLICT (event_code, from_user_id, to_user_id) DO NOTHING
+                """,
+                (me.event_code, me.telegram_user_id, other_user_id),
+            )
+        cur.execute(_CANDIDATE_SQL, _candidate_params(me, limit))
+        return [_row_to_profile(row) for row in cur.fetchall()]
 
     return _run(q)
 
@@ -803,65 +868,121 @@ def request_match(event_code: str, from_user_id: int, to_user_id: int) -> str:
     return _run(q)
 
 
-def respond_to_request(event_code: str, requester_id: int, responder_id: int, accept: bool) -> str:
-    """B answers A's request.
+def respond_to_request(event_code: str, requester_id: int, responder_id: int,
+                       accept: bool) -> str:
+    """B answers A's request in a known event. Returns the outcome only."""
+    outcome, _ = respond_to_pending_request(requester_id, responder_id, accept, event_code)
+    return outcome
 
-    Returns 'matched', 'declined', 'already_matched', 'already_declined',
+
+def respond_to_pending_request(requester_id: int, responder_id: int, accept: bool,
+                               event_code: str | None = None) -> tuple[str, str | None]:
+    """B answers A's request. Returns (outcome, event_code).
+
+    Outcome is 'matched', 'declined', 'already_matched', 'already_declined',
     'not_found', or 'closed' when the hackathon has closed.
+
+    `event_code` may be None: callback data cannot carry it, and looking it up with a
+    separate query meant every Accept paid two sequential round trips to Tokyo before
+    anything happened. Resolving it inside this transaction costs nothing extra and
+    keeps the lookup and the write under the same advisory lock, so the request cannot
+    change event or be answered twice in between.
     """
     if requester_id == responder_id:
-        return "not_found"
+        return "not_found", event_code
 
-    def q(cur: psycopg.Cursor) -> str:
-        if not _event_is_open(cur, event_code):
-            return "closed"
-        _pair_lock(cur, event_code, requester_id, responder_id)
-
-        cur.execute(
-            "SELECT 1 FROM matches WHERE event_code = %s AND user_a = %s AND user_b = %s",
-            (event_code, *sorted((requester_id, responder_id))),
-        )
-        if cur.fetchone():
-            return "already_matched"
-
-        cur.execute(
-            "SELECT status FROM interests WHERE event_code = %s AND from_user_id = %s AND to_user_id = %s",
-            (event_code, requester_id, responder_id),
-        )
-        row = cur.fetchone()
-        if not row or row["status"] not in ("pending", "accepted"):
-            if row and row["status"] == "declined":
-                return "already_declined"
-            return "not_found"
-
-        if not accept:
+    def q(cur: psycopg.Cursor) -> tuple[str, str | None]:
+        code = event_code
+        if code is None:
             cur.execute(
                 """
-                UPDATE interests SET status = 'declined', responded_at = now()
-                WHERE event_code = %s AND from_user_id = %s AND to_user_id = %s
+                SELECT event_code FROM interests
+                WHERE from_user_id = %s AND to_user_id = %s AND status = 'pending'
+                ORDER BY created_at DESC LIMIT 1
                 """,
-                (event_code, requester_id, responder_id),
+                (requester_id, responder_id),
             )
-            return "declined"
+            row = cur.fetchone()
+            if row is None:
+                return "not_found", None
+            code = row["event_code"]
+        return _respond_within(cur, code, requester_id, responder_id, accept), code
 
+    return _run(q)
+
+
+def _respond_within(cur: psycopg.Cursor, event_code: str, requester_id: int,
+                    responder_id: int, accept: bool) -> str:
+    """The body of respond_to_request, once the event is known."""
+    if not _event_is_open(cur, event_code):
+        return "closed"
+    _pair_lock(cur, event_code, requester_id, responder_id)
+
+    cur.execute(
+        "SELECT 1 FROM matches WHERE event_code = %s AND user_a = %s AND user_b = %s",
+        (event_code, *sorted((requester_id, responder_id))),
+    )
+    if cur.fetchone():
+        return "already_matched"
+
+    cur.execute(
+        "SELECT status FROM interests WHERE event_code = %s AND from_user_id = %s AND to_user_id = %s",
+        (event_code, requester_id, responder_id),
+    )
+    row = cur.fetchone()
+    if not row or row["status"] not in ("pending", "accepted"):
+        if row and row["status"] == "declined":
+            return "already_declined"
+        return "not_found"
+
+    if not accept:
         cur.execute(
             """
-            UPDATE interests SET status = 'accepted', responded_at = now()
+            UPDATE interests SET status = 'declined', responded_at = now()
             WHERE event_code = %s AND from_user_id = %s AND to_user_id = %s
             """,
             (event_code, requester_id, responder_id),
         )
+        return "declined"
+
+    cur.execute(
+        """
+        UPDATE interests SET status = 'accepted', responded_at = now()
+        WHERE event_code = %s AND from_user_id = %s AND to_user_id = %s
+        """,
+        (event_code, requester_id, responder_id),
+    )
+    cur.execute(
+        """
+        INSERT INTO interests (event_code, from_user_id, to_user_id, status, responded_at)
+        VALUES (%s, %s, %s, 'accepted', now())
+        ON CONFLICT (event_code, from_user_id, to_user_id)
+        DO UPDATE SET status = 'accepted', responded_at = now()
+        """,
+        (event_code, responder_id, requester_id),
+    )
+    created = _insert_match(cur, event_code, requester_id, responder_id)
+    return "matched" if created else "already_matched"
+
+
+def get_profiles(telegram_user_ids: Sequence[int], event_code: str) -> dict[int, Profile]:
+    """Several profiles from one event in a single round trip, keyed by user id.
+
+    Accepting a request needs both sides' profiles to render the two match cards.
+    Fetching them one at a time cost two sequential trips to Tokyo for rows the same
+    query could return together.
+    """
+    ids = list(dict.fromkeys(telegram_user_ids))
+    if not ids:
+        return {}
+
+    def q(cur: psycopg.Cursor) -> dict[int, Profile]:
         cur.execute(
-            """
-            INSERT INTO interests (event_code, from_user_id, to_user_id, status, responded_at)
-            VALUES (%s, %s, %s, 'accepted', now())
-            ON CONFLICT (event_code, from_user_id, to_user_id)
-            DO UPDATE SET status = 'accepted', responded_at = now()
-            """,
-            (event_code, responder_id, requester_id),
+            f"SELECT {_PROFILE_COLUMNS} FROM profiles "
+            "WHERE event_code = %s AND telegram_user_id = ANY(%s)",
+            (event_code, ids),
         )
-        created = _insert_match(cur, event_code, requester_id, responder_id)
-        return "matched" if created else "already_matched"
+        return {row["telegram_user_id"]: _row_to_profile(row) for row in cur.fetchall()}
 
     return _run(q)
 
@@ -1000,36 +1121,61 @@ if __name__ == "__main__":
         print(f"  profiles: {cur.fetchone()['n']}")
 
 
+def get_profile_with_status(event_code: str, viewer_id: int, other_id: int
+                            ) -> tuple[Profile | None, str]:
+    """A candidate's profile and how the viewer already stands with them, together.
+
+    Stepping Back needs both. Asking for them separately meant two sequential trips to
+    Tokyo for one card. Both reads share a transaction, so the label cannot disagree
+    with the profile it is attached to.
+    """
+
+    def q(cur: psycopg.Cursor) -> tuple[Profile | None, str]:
+        cur.execute(
+            f"SELECT {_PROFILE_COLUMNS} FROM profiles "
+            "WHERE telegram_user_id = %s AND event_code = %s",
+            (other_id, event_code),
+        )
+        row = cur.fetchone()
+        profile = _row_to_profile(row) if row else None
+        return profile, _interaction_status_within(cur, event_code, viewer_id, other_id)
+
+    return _run(q)
+
+
+def _interaction_status_within(cur: psycopg.Cursor, event_code: str,
+                               from_user_id: int, to_user_id: int) -> str:
+    """Cursor-level body of interaction_status, so callers can share a transaction."""
+    cur.execute(
+        "SELECT 1 FROM matches WHERE event_code = %s AND user_a = %s AND user_b = %s",
+        (event_code, *sorted((from_user_id, to_user_id))),
+    )
+    if cur.fetchone():
+        return "matched"
+
+    cur.execute(
+        "SELECT status FROM interests WHERE event_code = %s AND from_user_id = %s AND to_user_id = %s",
+        (event_code, from_user_id, to_user_id),
+    )
+    row = cur.fetchone()
+    if row:
+        return row["status"]
+
+    cur.execute(
+        """
+        SELECT 1 FROM interests
+        WHERE event_code = %s AND from_user_id = %s AND to_user_id = %s AND status = 'pending'
+        """,
+        (event_code, to_user_id, from_user_id),
+    )
+    return "incoming" if cur.fetchone() else "none"
+
+
+
 def interaction_status(event_code: str, from_user_id: int, to_user_id: int) -> str:
     """Read-only: how these two already stand. One of
 
     'matched', 'pending', 'declined', 'skipped', 'incoming', 'none'.
     Used to label a candidate the user has navigated back to; changes nothing.
     """
-
-    def q(cur: psycopg.Cursor) -> str:
-        cur.execute(
-            "SELECT 1 FROM matches WHERE event_code = %s AND user_a = %s AND user_b = %s",
-            (event_code, *sorted((from_user_id, to_user_id))),
-        )
-        if cur.fetchone():
-            return "matched"
-
-        cur.execute(
-            "SELECT status FROM interests WHERE event_code = %s AND from_user_id = %s AND to_user_id = %s",
-            (event_code, from_user_id, to_user_id),
-        )
-        row = cur.fetchone()
-        if row:
-            return row["status"]
-
-        cur.execute(
-            """
-            SELECT 1 FROM interests
-            WHERE event_code = %s AND from_user_id = %s AND to_user_id = %s AND status = 'pending'
-            """,
-            (event_code, to_user_id, from_user_id),
-        )
-        return "incoming" if cur.fetchone() else "none"
-
-    return _run(q)
+    return _run(lambda cur: _interaction_status_within(cur, event_code, from_user_id, to_user_id))

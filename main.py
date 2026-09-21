@@ -209,9 +209,9 @@ async def no_profile_prompt(update: Update) -> None:
 def db_guard(handler: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable[None]]:
     """Turn a database outage into a friendly message instead of a stack trace."""
 
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args: Any, **kwargs: Any) -> None:
         try:
-            await handler(update, context)
+            await handler(update, context, *args, **kwargs)
         except DatabaseError:
             logger.exception("Database error in %s", handler.__name__)
             if update.callback_query:
@@ -727,9 +727,16 @@ def _current_candidate_id(context: ContextTypes.DEFAULT_TYPE, event_code: str) -
 
 
 @db_guard
-async def find_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show the single best remaining candidate. Recomputed each time, so it is never stale."""
-    profile = await current_profile(update, context)
+async def find_matches(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                       profile: Profile | None = None, skip_id: int | None = None) -> None:
+    """Show the single best remaining candidate. Recomputed each time, so it is never stale.
+
+    Callers that have just loaded the profile pass it in. Re-reading it would be a
+    second round trip to Tokyo for a row we already hold, which the user waits through
+    before their next card appears.
+    """
+    if profile is None:
+        profile = await current_profile(update, context)
     if not profile:
         await no_profile_prompt(update)
         return
@@ -750,22 +757,24 @@ async def find_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = profile.telegram_user_id
     # Postgres applies the hard filters and returns one page, so browsing costs a
     # single indexed query no matter how large the event gets.
-    page = await run_db(db.find_candidates, profile, CANDIDATE_PAGE + 1)
+    if skip_id is not None:
+        # Recording the skip and reading the next page share one transaction.
+        page = await run_db(db.skip_and_find_candidates, profile, skip_id, CANDIDATE_PAGE + 1)
+    else:
+        page = await run_db(db.find_candidates, profile, CANDIDATE_PAGE + 1)
     ranked = rank_candidates(profile, page[:CANDIDATE_PAGE])
 
     if not ranked:
-        event = await run_db(db.get_event_row, profile.event_code)
-        if event and not event["is_active"]:
+        info = await run_db(db.empty_state_info, profile.event_code, user_id)
+        if info and not info["is_active"]:
             await send(
                 update,
-                f"<b>{kb.esc(event['name'])}</b> has closed. Your matches are still in /matches.",
+                f"<b>{kb.esc(info['name'])}</b> has closed. Your matches are still in /matches.",
                 reply_markup=kb.home_keyboard(),
             )
             return
 
-        skipped, seen, others = await run_db(
-            db.empty_state_counts, profile.event_code, user_id
-        )
+        skipped, seen, others = info["skipped"], info["interactions"], info["others"]
         if skipped:
             text = ("That's everyone new for now.\n\n"
                     "You can look again at the people you skipped, or widen what you're "
@@ -817,9 +826,11 @@ async def show_previous_candidate(update: Update, context: ContextTypes.DEFAULT_
 
     while index >= 0:
         candidate_id = history[index]
-        other = await run_db(db.get_profile, candidate_id, me.event_code)
+        # Profile and "seen earlier" label come back together — one round trip per step.
+        other, status = await run_db(
+            db.get_profile_with_status, me.event_code, me.telegram_user_id, candidate_id
+        )
         if other and other.is_matchable and candidate_id != me.telegram_user_id:
-            status = await run_db(db.interaction_status, me.event_code, me.telegram_user_id, candidate_id)
             _set_cursor(context, me.event_code, index)
             await send(
                 update,
@@ -865,7 +876,7 @@ async def handle_browse_action(update: Update, context: ContextTypes.DEFAULT_TYP
         await ack(query)
         cleared = await run_db(db.clear_skips, profile.telegram_user_id, profile.event_code)
         await safe_edit(query, f"Brought back {cleared} skipped teammate{'s' if cleared != 1 else ''}.")
-        await find_matches(update, context)
+        await find_matches(update, context, profile)
         return
 
     if action == "back":
@@ -874,7 +885,7 @@ async def handle_browse_action(update: Update, context: ContextTypes.DEFAULT_TYP
         await safe_edit(query, reply_markup=None)
         if not await show_previous_candidate(update, context, profile):
             await send(update, "That's the first teammate you've seen.")
-            await find_matches(update, context)
+            await find_matches(update, context, profile)
         return
 
     try:
@@ -884,19 +895,19 @@ async def handle_browse_action(update: Update, context: ContextTypes.DEFAULT_TYP
         candidate_id = _current_candidate_id(context, profile.event_code) if action == "next" else None
         if candidate_id is None:
             await ack(query)
-            await find_matches(update, context)
+            await find_matches(update, context, profile)
             return
 
     if candidate_id == profile.telegram_user_id:
         await ack(query)
-        await find_matches(update, context)
+        await find_matches(update, context, profile)
         return
 
     if action in ("next", "skip"):
-        await ack(query)
-        await run_db(db.record_skip, profile.telegram_user_id, profile.event_code, candidate_id)
         await safe_edit(query, "Seen.")
-        await find_matches(update, context)
+        # The skip is recorded inside the same transaction that reads the next page,
+        # so this is one round trip rather than two.
+        await find_matches(update, context, profile, skip_id=candidate_id)
         return
 
     if action == "req":
@@ -914,7 +925,7 @@ async def handle_request(
     other = await run_db(db.get_profile, candidate_id, me.event_code)
     if not other:
         await ack(query, "That teammate is no longer available.", show_alert=True)
-        await find_matches(update, context)
+        await find_matches(update, context, me)
         return
 
     result = await run_db(db.request_match, me.event_code, me.telegram_user_id, candidate_id)
@@ -936,7 +947,7 @@ async def handle_request(
     if result == "already_pending":
         await ack(query, "Already sent — waiting on their answer.", show_alert=True)
         await safe_edit(query, "Request already sent — waiting for their answer.")
-        await find_matches(update, context)
+        await find_matches(update, context, me)
         return
 
     if result == "closed":
@@ -951,12 +962,17 @@ async def handle_request(
 
     if result == "invalid":
         await ack(query)
-        await find_matches(update, context)
+        await find_matches(update, context, me)
         return
 
     # 'requested' — deliver my card to them so they never have to find me by chance.
     await ack(query, "Request sent")
     await safe_edit(query, "Request sent. I'll tell you when they answer.")
+
+    # The request is already committed, so the requester's screen can move on now.
+    # Delivering their card to the recipient is a separate Telegram round trip and
+    # nobody should watch their own next candidate wait for someone else's message.
+    await find_matches(update, context, me)
 
     my_card = score(other, me)   # scored from the recipient's point of view
     delivered = await notify(
@@ -967,7 +983,6 @@ async def handle_request(
     )
     if not delivered:
         logger.info("Request stored but not delivered to %s (blocked bot?)", candidate_id)
-    await find_matches(update, context)
 
 
 # --------------------------------------------------------- responding to asks
@@ -989,20 +1004,16 @@ async def handle_response(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await ack(query)
 
     me_id = update.effective_user.id
-    event_code = (
-        await run_db(db.find_pending_request_event, requester_id, me_id)
-        or context.user_data.get("event_code")
-    )
-    if not event_code:
-        await ack(query, "That request is no longer open.", show_alert=True)
-        await safe_edit(query, "This request is no longer open.", reply_markup=kb.home_keyboard())
-        return
 
-    context.user_data.setdefault("event_code", event_code)
-    result = await run_db(db.respond_to_request, event_code, requester_id, me_id, accept)
+    # One transaction finds the pending request, checks the event is open and applies
+    # the answer. It used to be two sequential round trips, and the request could in
+    # principle change between them.
+    result, event_code = await run_db(
+        db.respond_to_pending_request,
+        requester_id, me_id, accept, context.user_data.get("event_code"),
+    )
 
     if result == "closed":
-        await ack(query, "This hackathon has closed.", show_alert=True)
         await safe_edit(
             query,
             "This hackathon has closed, so new matches can't be made. "
@@ -1012,20 +1023,13 @@ async def handle_response(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if result in ("not_found", "already_declined"):
-        await ack(query, "That request is no longer open.", show_alert=True)
         await safe_edit(query, "This request is no longer open.", reply_markup=kb.home_keyboard())
         return
 
-    requester = await run_db(db.get_profile, requester_id, event_code)
-
-    if result == "already_matched":
-        await ack(query, "You're already matched")
-        if requester:
-            await safe_edit(query, kb.render_match(requester), reply_markup=kb.home_keyboard())
-        return
+    context.user_data.setdefault("event_code", event_code)
 
     if result == "declined":
-        await ack(query, "Declined")
+        # Nothing else to load: the decline is done and the requester is never told.
         await safe_edit(
             query,
             "Declined. They won't be told who said no.",
@@ -1033,9 +1037,18 @@ async def handle_response(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # result == 'matched' — notify exactly once, on this transition only.
-    me = await run_db(db.get_profile, me_id, event_code)
-    await ack(query, "It's a match")
+    # Both cards are needed — the requester's for this screen, mine for their message —
+    # so fetch them together rather than one after the other.
+    profiles = await run_db(db.get_profiles, (requester_id, me_id), event_code)
+    requester, me = profiles.get(requester_id), profiles.get(me_id)
+
+    if result == "already_matched":
+        if requester:
+            await safe_edit(query, kb.render_match(requester), reply_markup=kb.home_keyboard())
+        return
+
+    # result == 'matched' — this screen first, then the other person's message, so
+    # nobody waits on someone else's Telegram call to see their own match.
     if requester:
         await safe_edit(query, kb.render_match(requester), reply_markup=kb.home_keyboard())
     if me:
